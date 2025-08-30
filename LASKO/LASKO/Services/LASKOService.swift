@@ -411,9 +411,6 @@ class LASKOService: ObservableObject {
             let replies: Int?
             let repliesCount: IntOrString?
             let userRank: String?
-            let broadcastCount: IntOrString?
-            let tlsCount: IntOrString?
-            let followerCount: IntOrString?
         }
         
 
@@ -490,10 +487,7 @@ class LASKOService: ObservableObject {
                     replies: api.repliesCount?.asInt() ?? api.replies ?? 0,
                     isLiked: false,
                     userRank: api.userRank ?? "Bronze",
-                    tlsAddress: api.userAddress ?? api.address,
-                    broadcastCount: api.broadcastCount?.asInt() ?? 0,
-                    tlsCount: api.tlsCount?.asInt() ?? 0,
-                    followerCount: api.followerCount?.asInt() ?? 0
+                    tlsAddress: api.userAddress ?? api.address
                 )
             }
 
@@ -518,10 +512,7 @@ class LASKOService: ObservableObject {
                                 replies: api.repliesCount?.asInt() ?? api.replies ?? 0,
                                 isLiked: false,
                                 userRank: api.userRank ?? "Bronze",
-                                tlsAddress: api.userAddress ?? api.address,
-                                broadcastCount: api.broadcastCount?.asInt() ?? 0,
-                                tlsCount: api.tlsCount?.asInt() ?? 0,
-                                followerCount: api.followerCount?.asInt() ?? 0
+                                tlsAddress: api.userAddress ?? api.address
                             )
                         }
                         // Deduplicate by id
@@ -610,6 +601,9 @@ class LASKOService: ObservableObject {
                 let replies: Int?
                 let repliesCount: IntOrString?
                 let userRank: String?
+                let broadcastCount: IntOrString?
+                let tlsCount: IntOrString?
+                let followerCount: IntOrString?
             }
             struct Envelope: Decodable { let data: [APIPost]? }
             
@@ -639,7 +633,11 @@ class LASKOService: ObservableObject {
                     isLiked: false,
                     userRank: apiComment.userRank ?? "Bronze",
                     avatarURL: nil,
-                    parentCode: apiComment.parentSequentialCode
+                    parentCode: apiComment.parentSequentialCode,
+                    tlsAddress: apiComment.userAddress ?? apiComment.address,
+                    broadcastCount: apiComment.broadcastCount?.asInt() ?? 0,
+                    tlsCount: apiComment.tlsCount?.asInt() ?? 0,
+                    followerCount: apiComment.followerCount?.asInt() ?? 0
                 )
                 allComments.append(comment)
                 totalCount += 1
