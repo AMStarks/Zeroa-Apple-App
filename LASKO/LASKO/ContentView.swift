@@ -635,7 +635,8 @@ struct ModernPostCard: View {
                 if showReplies {
                     VStack(alignment: .leading, spacing: 8) {
                         if let replies = laskoService.repliesByCode[post.id], !replies.isEmpty {
-                            ForEach(replies) { r in
+                            let topReplies = getTopThreeComments(from: replies)
+                            ForEach(topReplies) { r in
                                 VStack(alignment: .leading, spacing: 4) {
                                     HStack {
                                         Text(laskoService.getDisplayName(for: r.author))
@@ -653,6 +654,15 @@ struct ModernPostCard: View {
                                 .padding(10)
                                 .background(LASKDesignSystem.Colors.cardBackground.opacity(0.3))
                                 .cornerRadius(10)
+                            }
+                            
+                            // Show "Show more" if there are more than 3 comments
+                            if replies.count > 3 {
+                                Text("Show more")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundColor(.orange)
+                                    .padding(.top, 4)
+                                    .padding(.leading, 10)
                             }
                         } else {
                             Text("No replies yet.")
@@ -684,7 +694,7 @@ struct ModernPostCard: View {
             .padding(.vertical, 16)
             .background(
                 Rectangle()
-                    .fill(Color.white.opacity(0.05))
+                    .fill(LASKDesignSystem.Colors.cardBackground.opacity(0.1))
             )
             .onAppear {
                 // Initialize local state from the incoming post
@@ -695,7 +705,7 @@ struct ModernPostCard: View {
         .buttonStyle(PlainButtonStyle())
         .background(
             Rectangle()
-                .fill(Color.white.opacity(0.05))
+                .fill(LASKDesignSystem.Colors.cardBackground.opacity(0.1))
         )
         .overlay(
             Rectangle()
@@ -1244,6 +1254,23 @@ func getRankImageName(for rank: String) -> String? {
     default:
         return nil
     }
+}
+
+// Helper function to get top three comments by points, follower count, or chronological order
+func getTopThreeComments(from replies: [Post]) -> [Post] {
+    let sortedReplies = replies.sorted { (r1, r2) -> Bool in
+        // Prioritize comments with more points
+        if r1.points != r2.points {
+            return r1.points > r2.points
+        }
+        // Then prioritize comments from users with more followers
+        if r1.followerCount != r2.followerCount {
+            return r1.followerCount > r2.followerCount
+        }
+        // Finally, sort by chronological order
+        return r1.timestamp < r2.timestamp
+    }
+    return Array(sortedReplies.prefix(3))
 }
 
 // Slide-out side menu

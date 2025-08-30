@@ -411,6 +411,9 @@ class LASKOService: ObservableObject {
             let replies: Int?
             let repliesCount: IntOrString?
             let userRank: String?
+            let broadcastCount: IntOrString?
+            let tlsCount: IntOrString?
+            let followerCount: IntOrString?
         }
         
 
@@ -487,7 +490,10 @@ class LASKOService: ObservableObject {
                     replies: api.repliesCount?.asInt() ?? api.replies ?? 0,
                     isLiked: false,
                     userRank: api.userRank ?? "Bronze",
-                    tlsAddress: api.userAddress ?? api.address
+                    tlsAddress: api.userAddress ?? api.address,
+                    broadcastCount: api.broadcastCount?.asInt() ?? 0,
+                    tlsCount: api.tlsCount?.asInt() ?? 0,
+                    followerCount: api.followerCount?.asInt() ?? 0
                 )
             }
 
@@ -512,7 +518,10 @@ class LASKOService: ObservableObject {
                                 replies: api.repliesCount?.asInt() ?? api.replies ?? 0,
                                 isLiked: false,
                                 userRank: api.userRank ?? "Bronze",
-                                tlsAddress: api.userAddress ?? api.address
+                                tlsAddress: api.userAddress ?? api.address,
+                                broadcastCount: api.broadcastCount?.asInt() ?? 0,
+                                tlsCount: api.tlsCount?.asInt() ?? 0,
+                                followerCount: api.followerCount?.asInt() ?? 0
                             )
                         }
                         // Deduplicate by id
@@ -522,38 +531,16 @@ class LASKOService: ObservableObject {
                 }
             }
 
-            // Stage 1: show posts immediately with server-provided counts
-            print("🔍 LASKO: Using initial reply counts from API for \(mapped.count) posts, then reconciling totals including nested replies")
+            // For now, use the replies count from the API response
+            // The comment counts should be accurate from the server
+            print("🔍 LASKO: Using reply counts from API response for \(mapped.count) posts")
             DispatchQueue.main.async {
                 self.posts = mapped
                 self.isLoading = false
             }
-            print("✅ LASKO: Loaded \(mapped.count) posts (initial)")
+            print("✅ LASKO: Loaded \(mapped.count) posts")
             for (i, post) in mapped.enumerated() {
                 print("🔍 LASKO: Post \(i): id=\(post.id), timestamp=\(post.timestamp), content=\(String(post.content.prefix(30)))")
-            }
-
-            // Stage 2: reconcile comment counts by counting nested replies concurrently
-            Task {
-                await withTaskGroup(of: (String, Int).self) { group in
-                    let candidates = mapped.filter { $0.replies > 0 }
-                    for p in candidates {
-                        group.addTask { [weak self] in
-                            guard let self = self else { return (p.id, p.replies) }
-                            let total = await self.fetchAllNestedComments(forPostCode: p.id, token: token)
-                            return (p.id, total)
-                        }
-                    }
-                    for await (postId, total) in group {
-                        await MainActor.run {
-                            if let idx = self.posts.firstIndex(where: { $0.id == postId }) {
-                                self.posts[idx].replies = total
-                                // Log for visibility (e.g., LAS#...027 should jump from 3 -> 11)
-                                print("✅ LASKO: Updated nested reply count for \(postId): \(total)")
-                            }
-                        }
-                    }
-                }
             }
         } catch {
             print("❌ LASKO: fetchPosts error: \(error)")
@@ -585,27 +572,18 @@ class LASKOService: ObservableObject {
         print("🔍 LASKO: fetchAllNestedComments called for post: \(postCode)")
         
         // Comments are stored as posts with parentSequentialCode, so query the main posts endpoint
-        var components = URLComponents(string: "\(effectiveBaseURL)/posts")
-        components?.queryItems = [
-            URLQueryItem(name: "parentSequentialCode", value: postCode),
-            URLQueryItem(name: "limit", value: "200")
-        ]
-        guard let url = components?.url else {
+        guard let url = URL(string: "\(effectiveBaseURL)/posts?parentSequentialCode=\(postCode)") else {
             print("❌ LASKO: Invalid URL for fetching comments for post \(postCode).")
             return 0
         }
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue(currentTLSAddress ?? "", forHTTPHeaderField: "X-TLS-Address")
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        if let bundleId = Bundle.main.bundleIdentifier { request.setValue(bundleId, forHTTPHeaderField: "X-Bundle-Id") }
+        request.addValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.addValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
         do {
-            print("🔍 LASKO: Making API request to: \(url)")
             let (data, response) = try await URLSession.shared.data(for: request)
-            print("🔍 LASKO: Received response for comments: \(String(data: data, encoding: .utf8) ?? "nil")")
             guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
                 let responseString = String(data: data, encoding: .utf8) ?? "No response data"
                 let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
