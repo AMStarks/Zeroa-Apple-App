@@ -560,23 +560,34 @@ class LASKOService: ObservableObject {
     }
     
     private func fetchAllNestedComments(forPostCode postCode: String, token: String) async -> Int {
-        print("🔍 LASKO: fetchAllNestedComments called for post: \(postCode)")
-        
-        // Comments are stored as posts with parentSequentialCode, so query the main posts endpoint
-        guard let url = URL(string: "\(effectiveBaseURL)/posts?parentSequentialCode=\(postCode)") else {
-            print("❌ LASKO: Invalid URL for fetching comments for post \(postCode).")
-            return 0
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.addValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.addValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-
         do {
+            // Comments are stored as posts with parentSequentialCode, so query the main posts endpoint
+            var components = URLComponents(string: "\(effectiveBaseURL)/posts")
+            components?.queryItems = [
+                URLQueryItem(name: "parentSequentialCode", value: postCode),
+                URLQueryItem(name: "limit", value: "200")
+            ]
+            guard let url = components?.url else {
+                print("❌ LASKO: Invalid URL for fetching comments for post \(postCode).")
+                return 0
+            }
+
+            var request = URLRequest(url: url)
+            request.httpMethod = "GET"
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            request.setValue(currentTLSAddress ?? "", forHTTPHeaderField: "X-TLS-Address")
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            if let bundleId = Bundle.main.bundleIdentifier {
+                request.setValue(bundleId, forHTTPHeaderField: "X-Bundle-Id")
+            }
+
+            print("🔍 LASKO: Making API request to: \(url)")
             let (data, response) = try await URLSession.shared.data(for: request)
-            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-                let responseString = String(data: data, encoding: .utf8) ?? "No response data"
+            let responseString = String(data: data, encoding: .utf8) ?? "nil"
+            print("🔍 LASKO: Received response for comments: \(responseString)")
+
+            guard let httpResponse = response as? HTTPURLResponse,
+                  httpResponse.statusCode == 200 else {
                 let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
                 print("❌ LASKO: fetchAllNestedComments server error for \(postCode): \(statusCode) \(responseString)")
                 return 0
@@ -609,13 +620,17 @@ class LASKOService: ObservableObject {
             
             let decoder = JSONDecoder()
             var items: [APIPost] = []
-            if let arr = try? decoder.decode([APIPost].self, from: data) {
+            
+            // Try to decode as envelope first (most likely structure)
+            if let env = try? decoder.decode(Envelope.self, from: data), let arr = env.data {
                 items = arr
-            } else if let env = try? decoder.decode(Envelope.self, from: data), let arr = env.data {
+                print("🔍 LASKO: Decoded \(items.count) comments from envelope structure")
+            } else if let arr = try? decoder.decode([APIPost].self, from: data) {
                 items = arr
-            } else if let any = try? JSONSerialization.jsonObject(with: data, options: []), let dict = any as? [String: Any], let arrAny = dict["data"] as? [[String: Any]] {
-                let arrData = try JSONSerialization.data(withJSONObject: arrAny, options: [])
-                items = (try? decoder.decode([APIPost].self, from: arrData)) ?? []
+                print("🔍 LASKO: Decoded \(items.count) comments from direct array structure")
+            } else {
+                print("❌ LASKO: Failed to decode comment response structure")
+                return 0
             }
 
             var allComments: [Post] = []
