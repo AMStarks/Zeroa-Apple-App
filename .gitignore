@@ -3,3 +3,29 @@ Zeroa/Data/
 halo-indexer-app/node_modules/
 halo-indexer-app/logs/
 logs/
+# General macOS / Xcode clutter
+.DS_Store
+*/.DS_Store
+**/.DS_Store
+*.xcuserstate
+
+# Build artefacts
+Pods/
+**/DerivedData/
+Zeroa.xcodeproj/xcuserdata/
+Zeroa.xcodeproj/project.xcworkspace/xcuserdata/
+Zeroa.xcworkspace/xcuserdata/
+Zeroa.xcworkspace/xcshareddata/WorkspaceSettings.xcsettings
+LASKO.xcodeproj/xcuserdata/
+LASKO/DerivedData/
+
+# Node / misc tooling
+**/node_modules/
+logs/
+
+# Problematic large scripts handled separately
+simple_test.py
+test_core_functionality.py
+download_tinyllama.py
+
+telestai/
