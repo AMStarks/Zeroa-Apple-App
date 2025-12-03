@@ -35,11 +35,14 @@ struct SendTransactionView: View {
     @State private var showCoinPicker = false
     @State private var availableCoins: [CoinType] = []
     @State private var isLoading = false
+    @State private var showSuccessToast = false
     @State private var estimatedFee: Double = 0.0
     @State private var showQRScanner = false
     @State private var selectedCurrency: String = "USD"
     @State private var availableCurrencies = ["USD", "EUR", "GBP", "JPY", "CAD", "AUD"]
     @State private var coinPrice: Double = 0.0
+    @State private var currentBalance: Double = 0.0
+    @StateObject private var tlsService = TLSBlockchainService.shared
     
     var body: some View {
         NavigationView {
@@ -122,6 +125,7 @@ struct SendTransactionView: View {
                                 .font(DesignSystem.Typography.bodyMedium)
                                 .onChange(of: transactionData.toAddress) { _, _ in
                                     validateAddress()
+                                    updateFeeEstimate()
                                 }
                             
                             Button(action: {
@@ -154,6 +158,7 @@ struct SendTransactionView: View {
                                         validateAmount()
                                         updateFiatAmount()
                                     }
+                                    updateFeeEstimate()
                                 }
                             
                             Text(transactionData.showFiatInput ? selectedCurrency : transactionData.coinType.symbol)
@@ -187,50 +192,38 @@ struct SendTransactionView: View {
                     }
                     .padding(.horizontal, DesignSystem.Spacing.lg)
                     
-                    // Fee Selection
+                    // Fee Display (automatically calculated)
                     VStack(alignment: .leading, spacing: DesignSystem.Spacing.sm) {
                         Text("Transaction Fee")
                             .font(DesignSystem.Typography.bodyMedium)
                             .fontWeight(.semibold)
                             .foregroundColor(DesignSystem.Colors.text)
                         
-                        VStack(spacing: DesignSystem.Spacing.sm) {
-                            Picker("Priority", selection: $transactionData.priority) {
-                                Text("Low").tag(SendTransactionRequest.TransactionPriority.low)
-                                Text("Medium").tag(SendTransactionRequest.TransactionPriority.medium)
-                                Text("High").tag(SendTransactionRequest.TransactionPriority.high)
+                        if estimatedFee > 0 {
+                            HStack {
+                                Image(systemName: "info.circle")
+                                    .font(.system(size: 14))
+                                    .foregroundColor(DesignSystem.Colors.secondary)
+                                
+                                Text("Fee: \(String(format: "%.8f", estimatedFee)) \(transactionData.coinType.symbol)")
+                                    .font(DesignSystem.Typography.bodySmall)
+                                    .foregroundColor(DesignSystem.Colors.textSecondary)
+                                
+                                Spacer()
                             }
-                            .pickerStyle(SegmentedPickerStyle())
-                            .onChange(of: transactionData.priority) { _, _ in
-                                updateFeeEstimate()
-                            }
-                            
-                            if estimatedFee > 0 {
-                                HStack {
-                                    Image(systemName: "info.circle")
-                                        .font(.system(size: 14))
-                                        .foregroundColor(DesignSystem.Colors.secondary)
-                                    
-                                    Text("Estimated fee: \(String(format: "%.8f", estimatedFee)) \(transactionData.coinType.symbol)")
-                                        .font(DesignSystem.Typography.bodySmall)
-                                        .foregroundColor(DesignSystem.Colors.textSecondary)
-                                    
-                                    Spacer()
-                                }
-                                .padding(.horizontal, DesignSystem.Spacing.sm)
-                                .padding(.vertical, DesignSystem.Spacing.xs)
-                                .background(DesignSystem.Colors.surface)
-                                .cornerRadius(DesignSystem.CornerRadius.small)
-                            }
+                            .padding(.horizontal, DesignSystem.Spacing.sm)
+                            .padding(.vertical, DesignSystem.Spacing.xs)
+                            .background(DesignSystem.Colors.surface)
+                            .cornerRadius(DesignSystem.CornerRadius.small)
                         }
-                        .padding(DesignSystem.Spacing.md)
-                        .background(DesignSystem.Colors.surface)
-                        .cornerRadius(DesignSystem.CornerRadius.medium)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.medium)
-                                .stroke(DesignSystem.Colors.border, lineWidth: 1)
-                        )
                     }
+                    .padding(DesignSystem.Spacing.md)
+                    .background(DesignSystem.Colors.surface)
+                    .cornerRadius(DesignSystem.CornerRadius.medium)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.medium)
+                            .stroke(DesignSystem.Colors.border, lineWidth: 1)
+                    )
                     .padding(.horizontal, DesignSystem.Spacing.lg)
                     
                     // Message (Optional)
@@ -286,6 +279,47 @@ struct SendTransactionView: View {
                     Spacer()
                 }
             }
+            if showSuccessToast {
+                VStack {
+                    Spacer()
+                    HStack {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.white)
+                            .font(.system(size: 24, weight: .bold))
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Transaction Sent!")
+                                .font(DesignSystem.Typography.bodyMedium)
+                                .fontWeight(.semibold)
+                                .foregroundColor(.white)
+                            if !transactionData.successMessage.isEmpty {
+                                Text(transactionData.successMessage)
+                                    .font(DesignSystem.Typography.caption)
+                                    .foregroundColor(.white.opacity(0.85))
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                        }
+                        Spacer()
+                        Button("OK") {
+                            showSuccessToast = false
+                            dismiss()
+                        }
+                        .font(DesignSystem.Typography.bodySmall)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.white)
+                        .padding(.horizontal, DesignSystem.Spacing.sm)
+                        .padding(.vertical, DesignSystem.Spacing.xs)
+                        .background(Color.white.opacity(0.2))
+                        .cornerRadius(DesignSystem.CornerRadius.small)
+                    }
+                    .padding()
+                    .background(LinearGradient(colors: [DesignSystem.Colors.secondary, DesignSystem.Colors.primary], startPoint: .leading, endPoint: .trailing).opacity(0.95))
+                    .cornerRadius(DesignSystem.CornerRadius.large)
+                    .padding()
+                }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .animation(.spring(response: 0.4, dampingFraction: 0.8), value: showSuccessToast)
+            }
         }
         .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -300,6 +334,11 @@ struct SendTransactionView: View {
             loadAvailableCoins()
             loadSettings()
             loadCoinPrice()
+            updateFeeEstimate()
+            loadBalance()
+        }
+        .onChange(of: transactionData.coinType) { _, _ in
+            loadBalance()
             updateFeeEstimate()
         }
         .sheet(isPresented: $showCoinPicker) {
@@ -322,7 +361,8 @@ struct SendTransactionView: View {
     
     // MARK: - Helper Methods
     private func loadAvailableCoins() {
-        availableCoins = CoinType.allCases
+        // Only show TLS (Telestai) coin
+        availableCoins = [.telestai]
     }
     
     private func loadSettings() {
@@ -412,19 +452,36 @@ struct SendTransactionView: View {
         // Get actual balance from the wallet service for the selected coin
         switch transactionData.coinType {
         case .telestai:
-            // Get actual TLS balance from the blockchain service
-            if let address = WalletService.shared.loadAddress() {
-                // For now, return a realistic balance based on the loaded address
-                // In a real implementation, this would query the blockchain
-                return 1.23456789
-            }
-            return 0.0
+            // Return the real balance from TLSBlockchainService
+            return currentBalance
         case .bitcoin: return 0.00123456
         case .litecoin: return 0.56789012
         case .flux: return 123.456789
         case .kaspa: return 45.67890123
         case .usdt: return 1000.0
         case .usdc: return 500.0
+        }
+    }
+    
+    private func loadBalance() {
+        Task {
+            if transactionData.coinType == .telestai {
+                if let address = WalletService.shared.loadAddress() {
+                    if let addressInfo = await tlsService.getAddressInfo(address: address) {
+                        await MainActor.run {
+                            currentBalance = addressInfo.balance
+                            print("✅ SendTransactionView: Balance updated to \(currentBalance) TLS")
+                        }
+                    } else {
+                        await MainActor.run {
+                            currentBalance = 0.0
+                            print("⚠️ SendTransactionView: Failed to load balance, using 0.0")
+                        }
+                    }
+                } else {
+                    print("❌ SendTransactionView: No wallet address found")
+                }
+            }
         }
     }
     
@@ -439,8 +496,16 @@ struct SendTransactionView: View {
             return
         }
         
-        if let balance = getCoinBalance(), amount > balance {
-            transactionData.errorMessage = "Insufficient balance"
+        // Account for transaction fee when checking balance
+        let totalNeeded = amount + estimatedFee
+        
+        if let balance = getCoinBalance() {
+            if totalNeeded > balance {
+                transactionData.errorMessage = "Insufficient balance. Available: \(String(format: "%.8f", balance)) TLS, Needed: \(String(format: "%.8f", totalNeeded)) TLS"
+                return
+            }
+        } else {
+            transactionData.errorMessage = "Could not retrieve balance"
             return
         }
         
@@ -477,12 +542,10 @@ struct SendTransactionView: View {
     }
     
     private func getTelestaiFeeEstimate() async -> Double {
-        // Telestai network fee estimation
-        switch transactionData.priority {
-        case .low: return 0.0001
-        case .medium: return 0.0002
-        case .high: return 0.0005
-        }
+        // Telestai network fee estimation - automatically calculated based on transaction size
+        // Estimate a typical transaction size (1 input, 2 outputs = ~250 bytes)
+        let typicalSize = FeeEstimationService.shared.estimateTransactionSize(inputCount: 1, outputCount: 2)
+        return await FeeEstimationService.shared.estimateFee(transactionSizeBytes: typicalSize)
     }
     
     private func getBitcoinFeeEstimate() async -> Double {
@@ -546,18 +609,49 @@ struct SendTransactionView: View {
     }
     
     private func sendTransaction() {
+        guard let amount = Double(transactionData.amount), amount > 0 else {
+            transactionData.errorMessage = "Please enter a valid amount"
+            return
+        }
+        
+        guard !transactionData.toAddress.isEmpty else {
+            transactionData.errorMessage = "Please enter a recipient address"
+            return
+        }
+        
         isLoading = true
+        transactionData.errorMessage = ""
+        transactionData.successMessage = ""
         
         Task {
-            // Simulate transaction sending
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
-            
-            await MainActor.run {
-                isLoading = false
-                transactionData.successMessage = "Transaction sent successfully!"
+            // Use real TLS transaction service
+            if transactionData.coinType == .telestai {
+                let response = await TLSBlockchainService.shared.sendPayment(
+                    toAddress: transactionData.toAddress.trimmingCharacters(in: .whitespacesAndNewlines),
+                    amount: amount,
+                    message: transactionData.message.isEmpty ? nil : transactionData.message,
+                    messageType: transactionData.message.isEmpty ? nil : "text"
+                )
                 
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                    dismiss()
+                await MainActor.run {
+                    isLoading = false
+                    
+                    if response.success {
+                        transactionData.successMessage = "Transaction sent successfully! TXID: \(response.txid?.prefix(16) ?? "unknown")..."
+                        showSuccessToast = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                            dismiss()
+                        }
+                    } else {
+                        transactionData.errorMessage = response.error ?? "Transaction failed"
+                    }
+                }
+            } else {
+                // For other coins, use MultiCoinTransactionService (currently mocked)
+                // This will be implemented when other coins are re-enabled
+                await MainActor.run {
+                    isLoading = false
+                    transactionData.errorMessage = "Only TLS (Telestai) transactions are currently supported"
                 }
             }
         }
@@ -764,13 +858,21 @@ struct ReceiveTransactionView: View {
     }
     
     private func loadAvailableCoins() {
-        availableCoins = CoinType.allCases
+        // Only show TLS (Telestai) coin
+        availableCoins = [.telestai]
     }
     
     private func generateReceiveAddress() {
         switch receiveData.coinType {
         case .telestai:
-            if let addr = walletService.loadAddress() { receiveData.address = addr } else { receiveData.address = "" }
+            // Use AddressManager to get next receive address (address rotation)
+            if let addr = AddressManager.shared.getNextReceiveAddress() {
+                receiveData.address = addr
+            } else if let addr = walletService.loadAddress() {
+                receiveData.address = addr
+            } else {
+                receiveData.address = ""
+            }
         case .flux:
             receiveData.address = AppGroupsService.shared.getFluxAddress() ?? ""
         default:

@@ -69,5 +69,20 @@
 	<array>
 		<string>lasko</string>
 	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Zeroa needs access to your local network to connect to the Halo API server for authentication and blockchain services.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSExceptionDomains</key>
+		<dict>
+			<key>192.168.0.121</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+				<key>NSIncludesSubdomains</key>
+				<true/>
+			</dict>
+		</dict>
+	</dict>
 </dict>
 </plist> 

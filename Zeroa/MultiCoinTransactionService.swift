@@ -15,15 +15,19 @@ class MultiCoinTransactionService: ObservableObject {
     @Published var lastBlockHeights: [CoinType: Int] = [:]
     
     private let walletService = WalletService.shared
+    private let walletStore = MultiCoinWalletService.shared
     private var cancellables = Set<AnyCancellable>()
+    private var balanceCache: [CoinType: (value: Double, updatedAt: Date)] = [:]
+    private let balanceCacheTTL: TimeInterval = 15
     
     // Coin services
     private let coinServices: [CoinType: CoinServiceProtocol] = [
-        .bitcoin: BitcoinService(),
-        .flux: FluxService(),
-        .litecoin: LitecoinService(),
-        .kaspa: KaspaService()
+        .telestai: TelestaiCoinServiceAdapter()
     ]
+    
+    var supportedCoins: [CoinType] {
+        coinServices.keys.sorted { $0.rawValue < $1.rawValue }
+    }
     
     // TLS service for messaging
     private let tlsService = TLSBlockchainService.shared
@@ -71,19 +75,45 @@ class MultiCoinTransactionService: ObservableObject {
     }
     
     // MARK: - Balance Management
-    func loadBalance(for coinType: CoinType) async {
-        guard let service = coinServices[coinType],
-              let address = walletService.loadAddress() else { return }
+    func loadBalance(for coinType: CoinType) async -> Double? {
+        guard let address = resolvedAddress(for: coinType),
+              let service = coinServices[coinType] else {
+            return nil
+        }
         
         let balance = await service.getBalance(address: address)
         await MainActor.run {
             self.currentBalances[coinType] = balance.total
         }
+        return balance.total
     }
     
     func refreshAllBalances() async {
-        for coinType in CoinType.allCases {
-            await loadBalance(for: coinType)
+        let coins = supportedCoins
+        let now = Date()
+        
+        for coin in coins {
+            if let cached = balanceCache[coin],
+               now.timeIntervalSince(cached.updatedAt) < balanceCacheTTL {
+                currentBalances[coin] = cached.value
+            }
+        }
+        
+        await withTaskGroup(of: (CoinType, Double?).self) { group in
+            for coin in coins {
+                group.addTask { [weak self] in
+                    guard let self = self else { return (coin, nil) }
+                    let value = await self.loadBalance(for: coin)
+                    return (coin, value)
+                }
+            }
+            
+            for await (coin, value) in group {
+                if let value = value {
+                    currentBalances[coin] = value
+                    balanceCache[coin] = (value, Date())
+                }
+            }
         }
     }
     
@@ -94,7 +124,7 @@ class MultiCoinTransactionService: ObservableObject {
     // MARK: - Transaction History
     func loadTransactionHistory(for coinType: CoinType) async {
         guard let service = coinServices[coinType],
-              let address = walletService.loadAddress() else { return }
+              let address = resolvedAddress(for: coinType) else { return }
         
         let transactions = await service.getTransactionHistory(address: address)
         await MainActor.run {
@@ -115,7 +145,7 @@ class MultiCoinTransactionService: ObservableObject {
         message: String? = nil
     ) async -> SendTransactionResponse {
         guard let service = coinServices[coinType],
-              let fromAddress = walletService.loadAddress() else {
+              let fromAddress = resolvedAddress(for: coinType) else {
             return SendTransactionResponse(
                 success: false,
                 txid: nil,
@@ -149,6 +179,16 @@ class MultiCoinTransactionService: ObservableObject {
         )
         
         // Send transaction
+        guard coinType == .telestai else {
+            return SendTransactionResponse(
+                success: false,
+                txid: nil,
+                error: "Only Telestai transactions are currently supported",
+                fee: nil,
+                confirmations: nil
+            )
+        }
+        
         let response = await service.sendTransaction(request: request)
         
         await MainActor.run {
@@ -287,6 +327,19 @@ class MultiCoinTransactionService: ObservableObject {
         pendingTransactions.removeAll()
         lastBlockHeights.removeAll()
     }
+
+    private func resolvedAddress(for coinType: CoinType) -> String? {
+        if let wallet = walletStore.selectedWallet,
+           let address = wallet.getAddress(for: coinType) {
+            return address
+        }
+        
+        if coinType == .telestai {
+            return walletService.loadAddress()
+        }
+        
+        return nil
+    }
 }
 
 // MARK: - Pending Transaction Model
@@ -328,7 +381,7 @@ struct TransactionSummary {
 // MARK: - Transaction Analytics
 extension MultiCoinTransactionService {
     func getTransactionSummary() -> TransactionSummary {
-        let allTransactions = CoinType.allCases.flatMap { coinType in
+        let allTransactions = supportedCoins.flatMap { coinType in
             getTransactionHistory(for: coinType)
         }
         return TransactionSummary(transactions: allTransactions)
@@ -340,7 +393,7 @@ extension MultiCoinTransactionService {
     }
     
     func getRecentActivity(limit: Int = 10) -> [WalletTransaction] {
-        let allTransactions = CoinType.allCases.flatMap { coinType in
+        let allTransactions = supportedCoins.flatMap { coinType in
             getTransactionHistory(for: coinType)
         }
         return allTransactions

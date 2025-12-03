@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 import UIKit
 import CryptoKit
 
@@ -38,6 +39,23 @@ class LASKOService: ObservableObject {
             print("🔍 LASKO: Username saved to UserDefaults")
         }
     }
+    
+    // Feature flags and tuning knobs (safe, additive)
+    struct FeatureFlags {
+        static let useDeepCountFromServer = true
+        static let prefetchCountsEnabled = true
+        static let cacheDeepCountsEnabled = true
+        static let deepCountCacheTTLSeconds: TimeInterval = 600 // 10 minutes
+        static let prefetchTopNPosts: Int = 8
+        static let useThreadEndpointIfAvailable = true // now enabled with server support
+    }
+
+    // MARK: - Lightweight telemetry (in-memory only)
+    private var cacheHits = 0
+    private var cacheMisses = 0
+    private var lastFetchPostsMs: Int = 0
+    private var lastFetchCommentsMsByCode: [String: Int] = [:]
+    private func nowMs() -> Int { Int(Date().timeIntervalSince1970 * 1000) }
     
     private static func generateRandomUsername() -> String {
         // Generate a random username for new users
@@ -81,6 +99,7 @@ class LASKOService: ObservableObject {
         return Date()
     }
     
+    // Use HTTPS for secure global access
     private let baseURL = "https://halo.telestai.io/api"
     private var effectiveBaseURL: String {
         if let override = appGroupsService.sharedDefaults?.string(forKey: "halo_indexer_base_url"), !override.isEmpty {
@@ -116,7 +135,7 @@ class LASKOService: ObservableObject {
             Task { @MainActor in
                 let ok = true
                 if ok {
-                    self.isAuthenticatedWithZeroa = true
+                self.isAuthenticatedWithZeroa = true
                     self.currentTLSAddress = resp.tlsAddress
                     
                     // Only generate username for new users if not already set
@@ -128,13 +147,18 @@ class LASKOService: ObservableObject {
                         print("🔍 LASKO: Preserving existing username: \(self.username)")
                     }
                     
+                    if let syncedName = self.appGroupsService.getProfileDisplayName(), !syncedName.isEmpty {
+                        self.username = syncedName
+                        print("🔍 LASKO: Synced username from App Groups: \(syncedName)")
+                    }
+                    
                     // Clear consumed response; request may already be cleared by Zeroa
                     AppGroupsService.shared.clearAuthResponse()
                     self.stopAuthPollingWindow()
                     print("✅ LASKO: Signature verified; identity established for \(resp.tlsAddress)")
-                } else {
-                    self.isAuthenticatedWithZeroa = false
-                    self.currentTLSAddress = nil
+        } else {
+                self.isAuthenticatedWithZeroa = false
+                self.currentTLSAddress = nil
                     print("❌ LASKO: Signature verification failed")
                 }
             }
@@ -174,10 +198,44 @@ class LASKOService: ObservableObject {
     // MARK: - Headless Polling Window
     private var authPollTimer: Timer?
     private var authPollDeadline: Date?
+    private var isObservingAuthResponse = false
     
     private func startAuthPollingWindow() {
         stopAuthPollingWindow()
         authPollDeadline = Date().addingTimeInterval(60)
+        
+        // Set up Darwin notification observer for immediate response
+        let notificationName = "com.telestai.zeroa.auth.response" as CFString
+        
+        // C callback function for Darwin notifications (static, doesn't need self)
+        let callback: @convention(c) (CFNotificationCenter?, UnsafeMutableRawPointer?, CFNotificationName?, UnsafeRawPointer?, CFDictionary?) -> Void = { (center, observer, name, object, userInfo) in
+            print("📢 LASKO: Received Darwin notification for auth response")
+            // Dispatch to main thread and trigger immediate handling
+            DispatchQueue.main.async {
+                // Post notification that will trigger checkForAuthResponse
+                NotificationCenter.default.post(name: NSNotification.Name("HandleAuthResponse"), object: nil)
+            }
+        }
+        
+        // Register for Darwin notifications
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            nil, // No observer needed since we use NotificationCenter
+            callback,
+            notificationName,
+            nil,
+            .deliverImmediately
+        )
+        isObservingAuthResponse = true
+        
+        // Listen for the local notification
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAuthResponseNotification),
+            name: NSNotification.Name("HandleAuthResponse"),
+            object: nil
+        )
+        
         authPollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             Task { @MainActor in
@@ -192,13 +250,35 @@ class LASKOService: ObservableObject {
                 }
             }
         }
-        print("⏱️ LASKO: Started 60s auth polling window")
+        print("⏱️ LASKO: Started 60s auth polling window with Darwin notification observer")
+    }
+    
+    @objc private func handleAuthResponseNotification() {
+        print("📢 LASKO: Processing auth response notification")
+        Task { @MainActor in
+            self.checkForAuthResponse()
+        }
     }
     
     private func stopAuthPollingWindow() {
         authPollTimer?.invalidate()
         authPollTimer = nil
         authPollDeadline = nil
+        
+        // Remove Darwin notification observer
+        if isObservingAuthResponse {
+            let notificationName = "com.telestai.zeroa.auth.response" as CFString
+            CFNotificationCenterRemoveObserver(
+                CFNotificationCenterGetDarwinNotifyCenter(),
+                nil,
+                CFNotificationName(notificationName),
+                nil
+            )
+            isObservingAuthResponse = false
+        }
+        
+        // Remove local notification observer
+        NotificationCenter.default.removeObserver(self, name: NSNotification.Name("HandleAuthResponse"), object: nil)
     }
 
     // MARK: - Zeroa Token Prompt
@@ -207,6 +287,19 @@ class LASKOService: ObservableObject {
         appGroupsService.sharedDefaults?.set(true, forKey: "halo_token_refresh_request")
         // Provide desired address context for Zeroa (optional key Zeroa can read)
         appGroupsService.sharedDefaults?.set(tlsAddress, forKey: "halo_token_for_address")
+        appGroupsService.sharedDefaults?.synchronize()
+        
+        // CRITICAL: Send Darwin notification to wake Zeroa (even if in background)
+        let notificationName = CFNotificationName("com.telestai.lasko.token.refresh.request" as CFString)
+        CFNotificationCenterPostNotification(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            notificationName,
+            nil,
+            nil,
+            true
+        )
+        print("📢 LASKO: Sent Darwin notification for token refresh request")
+        
         // For interactive foreground handoff, also drop a lightweight auth request if not present
         if appGroupsService.sharedDefaults?.object(forKey: "lasko_auth_request_nonce") == nil {
             let req = LASKOAuthRequest(
@@ -220,7 +313,6 @@ class LASKOService: ObservableObject {
             AppGroupsService.shared.storeLASKOAuthRequest(req)
             startAuthPollingWindow()
         }
-        appGroupsService.sharedDefaults?.synchronize()
     }
 
     // MARK: - Crypto utils
@@ -244,14 +336,60 @@ class LASKOService: ObservableObject {
         return (try? JSONSerialization.jsonObject(with: data, options: [])) as? [String: Any]
     }
 
+    // MARK: - Deep count cache (TTL-backed via App Groups)
+    private let deepCountCacheKey = "lasko_deep_count_cache"
+    private func getCachedDeepCount(for code: String) -> Int? {
+        guard FeatureFlags.cacheDeepCountsEnabled else { return nil }
+        guard let dict = appGroupsService.sharedDefaults?.dictionary(forKey: deepCountCacheKey) as? [String: [String: Any]],
+              let entry = dict[code],
+              let count = entry["count"] as? Int,
+              let ts = entry["ts"] as? TimeInterval else { return nil }
+        let now = Date().timeIntervalSince1970
+        if now - ts <= FeatureFlags.deepCountCacheTTLSeconds {
+            cacheHits += 1
+            return count
+        }
+        cacheMisses += 1
+        return nil
+    }
+    private func setCachedDeepCount(for code: String, count: Int) {
+        guard FeatureFlags.cacheDeepCountsEnabled else { return }
+        var dict = (appGroupsService.sharedDefaults?.dictionary(forKey: deepCountCacheKey) as? [String: [String: Any]]) ?? [:]
+        dict[code] = ["count": count, "ts": Date().timeIntervalSince1970]
+        appGroupsService.sharedDefaults?.set(dict, forKey: deepCountCacheKey)
+        appGroupsService.sharedDefaults?.synchronize()
+    }
+    
+    // Exposed helper to pre-warm Halo token early
+    func prewarmHaloTokenIfPossible() async {
+        guard appGroupsService.isProfileActive() else { return }
+        if let tls = (currentTLSAddress ?? appGroupsService.getTLSAddress()), !tls.isEmpty {
+            _ = await ensureTokenForAddress(tls, timeoutSeconds: 5.0)
+        }
+    }
+
     private func jwtSubject(_ token: String) -> String? {
         guard let payload = decodeJWTPayload(token) else { return nil }
         return payload["sub"] as? String
     }
 
     private func readHaloToken() -> String? {
-        return appGroupsService.sharedDefaults?.string(forKey: "halo_access_token") ??
-               appGroupsService.sharedDefaults?.string(forKey: "haloAccessToken")
+        // Force synchronization before reading
+        appGroupsService.sharedDefaults?.synchronize()
+        let token1 = appGroupsService.sharedDefaults?.string(forKey: "halo_access_token")
+        let token2 = appGroupsService.sharedDefaults?.string(forKey: "haloAccessToken")
+        let token = token1 ?? token2
+        if token != nil {
+            print("✅ LASKO: readHaloToken found token (length: \(token!.count))")
+        } else {
+            print("❌ LASKO: readHaloToken - no token found in App Groups")
+            // Debug: Check what keys exist
+            if let defaults = appGroupsService.sharedDefaults {
+                let allKeys = defaults.dictionaryRepresentation().keys.filter { $0.contains("halo") }
+                print("🔍 LASKO: App Groups keys containing 'halo': \(allKeys)")
+            }
+        }
+        return token
     }
 
     private func tokenIsFresh(_ token: String, leewaySeconds: TimeInterval = 60) -> Bool {
@@ -261,51 +399,87 @@ class LASKOService: ObservableObject {
     }
 
     private func ensureTokenForAddress(_ tlsAddress: String, timeoutSeconds: Double = 5.0) async -> String? {
+        print("🔍 LASKO: ensureTokenForAddress called for \(tlsAddress), timeout=\(timeoutSeconds)s")
+        guard appGroupsService.isProfileActive() else {
+            print("❌ LASKO: ensureTokenForAddress - profile not active")
+            return nil
+        }
         if let t = readHaloToken(), tokenIsFresh(t) {
             let sub = jwtSubject(t)
-            if sub == nil || sub == tlsAddress { return t }
+            if sub == nil || sub == tlsAddress {
+                print("✅ LASKO: ensureTokenForAddress - found fresh token with matching subject")
+                return t
+            }
+#if DEBUG
             print("⚠️ LASKO: Token subject (\(sub ?? "nil")) != TLS (\(tlsAddress)); will request refresh")
+#endif
         }
         
         // Check if we have any token, but only use it if it's fresh
         if let t = readHaloToken() {
             if tokenIsFresh(t) {
+#if DEBUG
                 print("✅ LASKO: Using existing fresh token")
+#endif
                 return t
             } else {
+#if DEBUG
                 print("⚠️ LASKO: Existing token is expired, requesting refresh")
+#endif
             }
         }
         
         // Ask Zeroa to refresh and require a newer refresh marker
         let requestStartMs = Int(Date().timeIntervalSince1970 * 1000)
+        print("🔍 LASKO: Requesting token refresh from Zeroa (requestStartMs=\(requestStartMs))")
         promptZeroaForToken(for: tlsAddress)
         let maxTries = Int(timeoutSeconds * 10)
         var tries = 0
         while tries < maxTries {
+            // Force sync before checking
+            appGroupsService.sharedDefaults?.synchronize()
             if let refreshedAtAny = appGroupsService.sharedDefaults?.object(forKey: "halo_token_refreshed_at") {
                 var refreshedAtMs = 0
                 if let n = refreshedAtAny as? Int { refreshedAtMs = n }
                 else if let n64 = refreshedAtAny as? Int64 { refreshedAtMs = Int(truncatingIfNeeded: n64) }
                 else if let d = refreshedAtAny as? Double { refreshedAtMs = Int(d) }
                 else if let s = refreshedAtAny as? String { refreshedAtMs = Int(s) ?? 0 }
+                print("🔍 LASKO: Polling attempt \(tries+1)/\(maxTries): refreshedAtMs=\(refreshedAtMs), requestStartMs=\(requestStartMs)")
                 if refreshedAtMs >= requestStartMs {
                     if let t = readHaloToken(), tokenIsFresh(t) {
                         let sub = jwtSubject(t)
-                        if sub == nil || sub == tlsAddress { return t }
+                        if sub == nil || sub == tlsAddress {
+                            print("✅ LASKO: ensureTokenForAddress - got refreshed token with matching subject")
+                            return t
+                        }
+#if DEBUG
                         print("⚠️ LASKO: Refreshed token subject (\(sub ?? "nil")) still != TLS (\(tlsAddress)); proceeding anyway")
+#endif
                         return t
+                    } else {
+                        print("⚠️ LASKO: Token refreshed but not found or not fresh yet")
                     }
+                } else {
+                    print("🔍 LASKO: Token refresh timestamp not updated yet (refreshedAtMs < requestStartMs)")
+                }
+            } else {
+                if tries % 10 == 0 { // Log every second
+                    print("🔍 LASKO: Polling attempt \(tries+1)/\(maxTries): halo_token_refreshed_at not set yet")
                 }
             }
             tries += 1
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
-        if let t = readHaloToken(), tokenIsFresh(t) { return t }
+        if let t = readHaloToken(), tokenIsFresh(t) {
+            print("✅ LASKO: ensureTokenForAddress - found token after timeout")
+            return t
+        }
+        print("❌ LASKO: ensureTokenForAddress - failed to get token after \(timeoutSeconds)s timeout")
         return nil
     }
 
     private func ensureValidHaloToken(timeoutSeconds: Double = 5.0) async -> String? {
+        guard appGroupsService.isProfileActive() else { return nil }
         if let t = readHaloToken(), tokenIsFresh(t) { return t }
         // Ask Zeroa to refresh and require a newer refresh marker
         let requestStartMs = Int(Date().timeIntervalSince1970 * 1000)
@@ -349,18 +523,31 @@ class LASKOService: ObservableObject {
                 ]
                 req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [])
                 let (data, response) = try await URLSession.shared.data(for: req)
-                if let http = response as? HTTPURLResponse, http.statusCode == 200 {
-                    // Accept either {ok:true} or {token:...,exp:...} shapes
+                guard let http = response as? HTTPURLResponse else { continue }
+                
+                if http.statusCode == 200 {
+                    if data.isEmpty { return true }
                     if let obj = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
-                        if let ok = obj["ok"] as? Bool, ok { return true }
-                        // If server returns a token on verify, presence implies success
-                        if obj["token"] != nil { return true }
+                        if let ok = obj["ok"] as? Bool { return ok }
+                        if let success = obj["success"] as? Bool { return success }
+                        if let verified = obj["verified"] as? Bool { return verified }
+                        if let token = obj["token"] as? String, !token.isEmpty { return true }
                     }
-            return true
-                } else if let http = response as? HTTPURLResponse, http.statusCode == 404 {
+                    print("⚠️ LASKO: Unexpected signature verification response for \(path)")
+                    return false
+                } else if http.statusCode == 404 {
                     continue
+                } else {
+                    let bodyStr = String(data: data, encoding: .utf8) ?? ""
+                    if bodyStr.isEmpty {
+                        print("❌ LASKO: Signature verification failed via \(path) status=\(http.statusCode)")
+                    } else {
+                        print("❌ LASKO: Signature verification failed via \(path) status=\(http.statusCode) body=\(bodyStr)")
+                    }
+                    return false
                 }
             } catch {
+                print("❌ LASKO: Signature verification request to \(path) failed: \(error)")
                 continue
             }
         }
@@ -410,12 +597,18 @@ class LASKOService: ObservableObject {
             let likesCount: IntOrString?
             let replies: Int?
             let repliesCount: IntOrString?
+            let deepRepliesCount: IntOrString?
+            let tlsCount: IntOrString?
             let userRank: String?
+            let profileName: String?
+            let profileBio: String?
+            let profileImage: String? // base64 encoded image
         }
         
 
         
         do {
+            let t0 = nowMs()
             print("🔗 LASKO: Using Indexer base URL: \(effectiveBaseURL)")
             guard let url = URL(string: "\(effectiveBaseURL)/posts?limit=50") else { throw URLError(.badURL) }
             var request = URLRequest(url: url)
@@ -478,17 +671,58 @@ class LASKOService: ObservableObject {
                 let tsStr = api.timestamp?.asInt()?.description ?? "nil"
                 let tsMsStr = api.timestampMs?.asInt()?.description ?? "nil"
                 print("🔍 LASKO: Parsing post \(api.sequentialCode ?? "nil"): createdAt=\(api.createdAt ?? "nil"), timestamp=\(tsStr), timestampMs=\(tsMsStr) -> parsed=\(parsedTimestamp)")
+                // Prefer server-provided deep count when available
+                let deep = api.deepRepliesCount?.asInt()
+                let shallow = (api.repliesCount?.asInt()) ?? api.replies
+                let repliesVal = (FeatureFlags.useDeepCountFromServer ? (deep ?? shallow) : shallow) ?? 0
+                // Use profileName from API if available, otherwise fall back to getDisplayName
+                let authorName: String
+                if let profileName = api.profileName, !profileName.isEmpty {
+                    authorName = profileName
+                } else {
+                    authorName = getDisplayName(for: api.userAddress ?? api.author ?? api.address ?? "Unknown")
+                }
+                
+                // Convert base64 profileImage to data URL format for avatarURL
+                // For current user's posts, prioritize App Groups profile image over API
+                let userAddress = api.userAddress ?? api.address ?? ""
+                let isCurrentUser = !userAddress.isEmpty && userAddress == currentTLSAddress
+                
+                let avatarURL: String?
+                if isCurrentUser, let appGroupsImage = appGroupsService.getProfileImage(),
+                   let imageData = appGroupsImage.jpegData(compressionQuality: 0.7) {
+                    // Use App Groups image for current user (always up-to-date)
+                    let base64String = imageData.base64EncodedString()
+                    avatarURL = "data:image/jpeg;base64,\(base64String)"
+                } else if let profileImageBase64 = api.profileImage, !profileImageBase64.isEmpty {
+                    // Use API profile image for other users
+                    avatarURL = "data:image/jpeg;base64,\(profileImageBase64)"
+                } else {
+                    avatarURL = nil
+                }
+                
                 return Post(
                     id: api.sequentialCode ?? api.code ?? api.id ?? UUID().uuidString,
                     content: api.content ?? "",
-                    author: getDisplayName(for: api.userAddress ?? api.author ?? api.address ?? "Unknown"),
+                    author: authorName,
                     timestamp: parsedTimestamp,
                     likes: api.likesCount?.asInt() ?? api.likes ?? 0,
-                    replies: api.repliesCount?.asInt() ?? api.replies ?? 0,
+                    replies: repliesVal,
                     isLiked: false,
                     userRank: api.userRank ?? "Bronze",
-                    tlsAddress: api.userAddress ?? api.address
+                    avatarURL: avatarURL,
+                    tlsAddress: userAddress,
+                    broadcastCount: 0,
+                    tlsCount: api.tlsCount?.asInt() ?? 0,
+                    followerCount: 0
                 )
+            }
+
+            // Override with cached deep counts if fresher
+            for i in mapped.indices {
+                if let cached = getCachedDeepCount(for: mapped[i].id), cached > mapped[i].replies {
+                    mapped[i].replies = cached
+                }
             }
 
             // Also fetch user's own posts to ensure previously created posts appear
@@ -506,12 +740,13 @@ class LASKOService: ObservableObject {
                             Post(
                                 id: api.sequentialCode ?? api.code ?? api.id ?? UUID().uuidString,
                                 content: api.content ?? "",
-                                author: getDisplayName(for: api.userAddress ?? api.author ?? api.address ?? "Unknown"),
+                                author: (api.profileName?.isEmpty == false) ? api.profileName! : getDisplayName(for: api.userAddress ?? api.author ?? api.address ?? "Unknown"),
                                 timestamp: parseDate(isoString: api.createdAt, ts: api.timestamp, tsMs: api.timestampMs),
                                 likes: api.likesCount?.asInt() ?? api.likes ?? 0,
                                 replies: api.repliesCount?.asInt() ?? api.replies ?? 0,
                                 isLiked: false,
                                 userRank: api.userRank ?? "Bronze",
+                                avatarURL: (api.profileImage?.isEmpty == false) ? "data:image/jpeg;base64,\(api.profileImage!)" : nil,
                                 tlsAddress: api.userAddress ?? api.address
                             )
                         }
@@ -529,9 +764,24 @@ class LASKOService: ObservableObject {
                 self.posts = mapped
                 self.isLoading = false
             }
-            print("✅ LASKO: Loaded \(mapped.count) posts")
+            lastFetchPostsMs = nowMs() - t0
+            print("✅ LASKO: Loaded \(mapped.count) posts (\(lastFetchPostsMs)ms) cacheHits=\(cacheHits) cacheMisses=\(cacheMisses)")
             for (i, post) in mapped.enumerated() {
                 print("🔍 LASKO: Post \(i): id=\(post.id), timestamp=\(post.timestamp), content=\(String(post.content.prefix(30)))")
+            }
+
+            // Prefetch deep counts for top N visible posts
+            if FeatureFlags.prefetchCountsEnabled {
+                let n = min(FeatureFlags.prefetchTopNPosts, mapped.count)
+                Task { [weak self] in
+                    guard let self = self else { return }
+                    for idx in 0..<n {
+                        let p = mapped[idx]
+                        if p.replies > 0 && self.repliesByCode[p.id] == nil {
+                            await self.fetchComments(forSequentialCode: p.id)
+                        }
+                    }
+                }
             }
         } catch {
             print("❌ LASKO: fetchPosts error: \(error)")
@@ -548,20 +798,41 @@ class LASKOService: ObservableObject {
         // Ensure auth
         guard let tls = (currentTLSAddress ?? appGroupsService.getTLSAddress()), !tls.isEmpty else { 
             print("❌ LASKO: fetchComments failed - no TLS address")
+            return
+        }
+        // Try to get a fresh token; if missing/expired, attempt refresh
+        var tokenOpt = await ensureTokenForAddress(tls, timeoutSeconds: 8.0)
+        if tokenOpt == nil {
+            print("⚠️ LASKO: fetchComments token missing/expired; attempting refresh")
+            let refreshed = await ensureValidHaloToken(timeoutSeconds: 8.0)
+            if let refreshed = refreshed {
+                tokenOpt = refreshed
+            } else {
+                tokenOpt = await ensureTokenForAddress(tls, timeoutSeconds: 8.0)
+            }
+        }
+        guard let token = tokenOpt else {
+            print("❌ LASKO: fetchComments failed - no token after refresh attempt")
                 return
         }
-        guard let token = await ensureTokenForAddress(tls, timeoutSeconds: 5.0) else { 
-            print("❌ LASKO: fetchComments failed - no token")
-                    return
-                }
         
-        // Fetch all comments for this post (including nested replies)
-        let totalCommentCount = await fetchAllNestedComments(forPostCode: code, token: token)
+        // Prefer thread endpoint if enabled; otherwise fallback to recursive nested fetch
+        let totalCommentCount: Int
+        if FeatureFlags.useThreadEndpointIfAvailable {
+            if let count = await fetchThreadEndpointIfAvailable(forPostCode: code, token: token) {
+                totalCommentCount = count
+            } else {
+                totalCommentCount = await fetchAllNestedComments(forPostCode: code, token: token)
+            }
+        } else {
+            totalCommentCount = await fetchAllNestedComments(forPostCode: code, token: token)
+        }
         
         // Update the post's reply count to reflect the actual fetched comments
         await MainActor.run {
             if let postIndex = self.posts.firstIndex(where: { $0.id == code }) {
                 self.posts[postIndex].replies = totalCommentCount
+                self.setCachedDeepCount(for: code, count: totalCommentCount)
                 print("🔍 LASKO: Updated post \(code) reply count to \(totalCommentCount)")
             }
         }
@@ -569,37 +840,41 @@ class LASKOService: ObservableObject {
     
     private func fetchAllNestedComments(forPostCode postCode: String, token: String) async -> Int {
         print("🔍 LASKO: fetchAllNestedComments called for post: \(postCode)")
+        let t0 = nowMs()
         
         // Comments are stored as posts with parentSequentialCode, so query the main posts endpoint
-        guard let url = URL(string: "\(effectiveBaseURL)/posts?parentSequentialCode=\(postCode)") else {
+        var components = URLComponents(string: "\(effectiveBaseURL)/posts")
+        components?.queryItems = [
+            URLQueryItem(name: "parentSequentialCode", value: postCode),
+            URLQueryItem(name: "limit", value: "200")
+        ]
+        guard let url = components?.url else {
             print("❌ LASKO: Invalid URL for fetching comments for post \(postCode).")
             return 0
         }
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.addValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.addValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(currentTLSAddress ?? "", forHTTPHeaderField: "X-TLS-Address")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let bundleId = Bundle.main.bundleIdentifier { request.setValue(bundleId, forHTTPHeaderField: "X-Bundle-Id") }
+        print("🔍 LASKO: Making API request to: \(url.absoluteString)")
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-                let responseString = String(data: data, encoding: .utf8) ?? "No response data"
-                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-                print("❌ LASKO: fetchAllNestedComments server error for \(postCode): \(statusCode) \(responseString)")
-                return 0
-            }
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let responseString = String(data: data, encoding: .utf8) ?? "nil"
+        print("🔍 LASKO: Received response for comments: \(responseString)")
 
             // Reuse decoding helpers
             struct APIPost: Decodable {
                 let id: String?
-                let sequentialCode: String?
+        let sequentialCode: String?
                 let code: String?
-                let content: String?
+        let content: String?
                 let author: String?
                 let address: String?
                 let userAddress: String?
-                let parentSequentialCode: String?
+        let parentSequentialCode: String?
                 let parentCode: String?
                 let createdAt: String?
                 let timestamp: IntOrString?
@@ -612,6 +887,9 @@ class LASKOService: ObservableObject {
                 let broadcastCount: IntOrString?
                 let tlsCount: IntOrString?
                 let followerCount: IntOrString?
+                let profileName: String?
+                let profileBio: String?
+                let profileImage: String? // base64 encoded image
             }
             struct Envelope: Decodable { let data: [APIPost]? }
             
@@ -629,37 +907,53 @@ class LASKOService: ObservableObject {
             var allComments: [Post] = []
             var totalCount = 0
 
-            for apiComment in items {
+            // Map API comments to Post models
+            let mappedComments: [(post: Post, code: String?)] = items.map { apiComment in
                 let parsedTimestamp = parseDate(isoString: apiComment.createdAt, ts: apiComment.timestamp, tsMs: apiComment.timestampMs)
+                let id = apiComment.sequentialCode ?? apiComment.code ?? apiComment.id ?? UUID().uuidString
                 let comment = Post(
-                    id: apiComment.sequentialCode ?? apiComment.code ?? apiComment.id ?? UUID().uuidString,
+                    id: id,
                     content: apiComment.content ?? "",
-                    author: getDisplayName(for: apiComment.userAddress ?? apiComment.address ?? ""),
+                    author: (apiComment.profileName?.isEmpty == false) ? apiComment.profileName! : getDisplayName(for: apiComment.userAddress ?? apiComment.address ?? ""),
                     timestamp: parsedTimestamp,
                     likes: apiComment.likesCount?.asInt() ?? apiComment.likes ?? 0,
                     replies: apiComment.repliesCount?.asInt() ?? apiComment.replies ?? 0,
                     isLiked: false,
                     userRank: apiComment.userRank ?? "Bronze",
-                    avatarURL: nil,
+                    avatarURL: (apiComment.profileImage?.isEmpty == false) ? "data:image/jpeg;base64,\(apiComment.profileImage!)" : nil,
                     parentCode: apiComment.parentSequentialCode,
                     tlsAddress: apiComment.userAddress ?? apiComment.address,
                     broadcastCount: apiComment.broadcastCount?.asInt() ?? 0,
                     tlsCount: apiComment.tlsCount?.asInt() ?? 0,
                     followerCount: apiComment.followerCount?.asInt() ?? 0
                 )
-                allComments.append(comment)
-                totalCount += 1
-
-                // Recursively fetch nested comments
-                if let commentCode = apiComment.sequentialCode {
-                    let nestedCount = await fetchAllNestedComments(forPostCode: commentCode, token: token)
-                    totalCount += nestedCount
-                }
+                return (comment, apiComment.sequentialCode)
             }
+
+            allComments.append(contentsOf: mappedComments.map { $0.post })
+            totalCount += mappedComments.count
+
+            // Recursively fetch nested comments concurrently with a soft cap (by natural awaiting)
+            let nestedCodes = mappedComments.compactMap { $0.code }
+            let nestedTotal = await withTaskGroup(of: Int.self, returning: Int.self) { group in
+                for code in nestedCodes {
+                    group.addTask { [weak self] in
+                        guard let self = self else { return 0 }
+                        return await self.fetchAllNestedComments(forPostCode: code, token: token)
+                    }
+                }
+                var sum = 0
+                for await n in group { sum += n }
+                return sum
+            }
+            totalCount += nestedTotal
 
             await MainActor.run {
                 self.repliesByCode[postCode] = allComments.sorted { $0.timestamp < $1.timestamp }
-                print("✅ LASKO: Fetched \(allComments.count) comments for \(postCode)")
+                self.setCachedDeepCount(for: postCode, count: totalCount)
+                let dur = nowMs() - t0
+                self.lastFetchCommentsMsByCode[postCode] = dur
+                print("✅ LASKO: Fetched \(allComments.count) comments for \(postCode) (\(dur)ms)")
             }
             return totalCount
 
@@ -669,9 +963,246 @@ class LASKOService: ObservableObject {
         }
     }
 
+    // MARK: - Thread endpoint (optional, guarded)
+    private func fetchThreadEndpointIfAvailable(forPostCode postCode: String, token: String) async -> Int? {
+        // Try an endpoint that returns the entire thread for a post in one response
+        // Expected candidates: /posts/thread?sequentialCode=..., or /posts/{code}/thread
+        // We'll attempt both; if both fail, return nil.
+        let candidateURLs: [URL?] = {
+            var urls: [URL?] = []
+            var comps = URLComponents(string: "\(effectiveBaseURL)/posts")
+            comps?.queryItems = [
+                URLQueryItem(name: "thread", value: "1"),
+                URLQueryItem(name: "sequentialCode", value: postCode),
+                URLQueryItem(name: "limit", value: "500")
+            ]
+            urls.append(comps?.url)
+            let pathEncoded = postCode.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? postCode
+            urls.append(URL(string: "\(effectiveBaseURL)/posts/\(pathEncoded)/thread"))
+            return urls
+        }()
+        for urlOpt in candidateURLs {
+            guard let url = urlOpt else { continue }
+            var request = URLRequest(url: url)
+            request.httpMethod = "GET"
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            request.setValue(currentTLSAddress ?? "", forHTTPHeaderField: "X-TLS-Address")
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            if let bundleId = Bundle.main.bundleIdentifier { request.setValue(bundleId, forHTTPHeaderField: "X-Bundle-Id") }
+            print("🔍 LASKO: Trying thread endpoint: \(url.absoluteString)")
+            do {
+                let t0 = nowMs()
+                let (data, response) = try await URLSession.shared.data(for: request)
+                if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
+                    print("⚠️ LASKO: Thread endpoint status=\(http.statusCode) for \(url.absoluteString)")
+                    continue
+                }
+
+                // Decode possible shapes
+                struct APIPost: Decodable {
+                    let id: String?
+                    let sequentialCode: String?
+                    let code: String?
+                    let content: String?
+                    let author: String?
+                    let address: String?
+                    let userAddress: String?
+                    let parentSequentialCode: String?
+                    let parentCode: String?
+                    let createdAt: String?
+                    let timestamp: IntOrString?
+                    let timestampMs: IntOrString?
+                    let likes: Int?
+                    let likesCount: IntOrString?
+                    let replies: Int?
+                    let repliesCount: IntOrString?
+                    let userRank: String?
+                    let broadcastCount: IntOrString?
+                    let tlsCount: IntOrString?
+                    let followerCount: IntOrString?
+                    let profileName: String?
+                    let profileBio: String?
+                    let profileImage: String? // base64 encoded image
+                    let children: [APIPost]? // nested tree variant
+                    let comments: [APIPost]? // alternate key
+                }
+                struct EnvelopeArr: Decodable { let data: [APIPost]?; let posts: [APIPost]?; let result: [APIPost]? }
+                struct EnvelopeObj: Decodable { let data: APIPost? }
+
+                let decoder = JSONDecoder()
+
+                func mapFlat(_ items: [APIPost]) -> [Post] {
+                    items.map { api in
+                        Post(
+                            id: api.sequentialCode ?? api.code ?? api.id ?? UUID().uuidString,
+                            content: api.content ?? "",
+                            author: (api.profileName?.isEmpty == false) ? api.profileName! : getDisplayName(for: api.userAddress ?? api.address ?? ""),
+                            timestamp: parseDate(isoString: api.createdAt, ts: api.timestamp, tsMs: api.timestampMs),
+                            likes: api.likesCount?.asInt() ?? api.likes ?? 0,
+                            replies: api.repliesCount?.asInt() ?? api.replies ?? 0,
+                            isLiked: false,
+                            userRank: api.userRank ?? "Bronze",
+                            avatarURL: (api.profileImage?.isEmpty == false) ? "data:image/jpeg;base64,\(api.profileImage!)" : nil,
+                            parentCode: api.parentSequentialCode ?? api.parentCode,
+                            tlsAddress: api.userAddress ?? api.address,
+                            broadcastCount: api.broadcastCount?.asInt() ?? 0,
+                            tlsCount: api.tlsCount?.asInt() ?? 0,
+                            followerCount: api.followerCount?.asInt() ?? 0
+                        )
+                    }
+                }
+
+                func flattenTree(_ node: APIPost) -> [APIPost] {
+                    var acc: [APIPost] = [node]
+                    let kids = node.children ?? node.comments ?? []
+                    for ch in kids { acc.append(contentsOf: flattenTree(ch)) }
+                    return acc
+                }
+
+                var postsFlat: [Post] = []
+                if let arr = try? decoder.decode([APIPost].self, from: data) {
+                    postsFlat = mapFlat(arr)
+                } else if let env = try? decoder.decode(EnvelopeArr.self, from: data) {
+                    let arr = env.data ?? env.posts ?? env.result ?? []
+                    postsFlat = mapFlat(arr)
+                } else if let obj = try? decoder.decode(EnvelopeObj.self, from: data), let root = obj.data {
+                    let flattened = flattenTree(root)
+                    postsFlat = mapFlat(flattened)
+                } else if let root = try? decoder.decode(APIPost.self, from: data) {
+                    postsFlat = mapFlat(flattenTree(root))
+                } else if let any = try? JSONSerialization.jsonObject(with: data, options: []),
+                          let dict = any as? [String: Any] {
+                    if let commentsAny = dict["comments"] as? [[String: Any]] {
+                        let arrData = try JSONSerialization.data(withJSONObject: commentsAny, options: [])
+                        if let decoded = try? decoder.decode([APIPost].self, from: arrData) {
+                            postsFlat = mapFlat(decoded)
+                        }
+                    }
+                }
+
+                // Remove the root post itself if present; keep only replies under postCode
+                let repliesOnly = postsFlat.filter { $0.id != postCode }
+                await MainActor.run {
+                    self.repliesByCode[postCode] = repliesOnly.sorted { $0.timestamp < $1.timestamp }
+                    self.setCachedDeepCount(for: postCode, count: repliesOnly.count)
+                    let dur = nowMs() - t0
+                    self.lastFetchCommentsMsByCode[postCode] = dur
+                    print("✅ LASKO: Thread endpoint returned \(repliesOnly.count) comments for \(postCode) (\(dur)ms)")
+                }
+                return repliesOnly.count
+            } catch {
+                print("⚠️ LASKO: Thread endpoint error for \(url.absoluteString): \(error.localizedDescription)")
+                continue
+            }
+        }
+        return nil
+    }
+
+    private func requestZeroaSignature(content: String, tlsAddress: String, timestampMs: Int) async -> ZeroaSignaturePayload? {
+        guard let defaults = appGroupsService.sharedDefaults else {
+            print("❌ LASKO: Cannot request signature – App Groups container unavailable")
+            return nil
+        }
+        let contentData = Data(content.utf8)
+        let contentHashHex = sha256Hex(of: contentData)
+        let bundleId = Bundle.main.bundleIdentifier ?? "com.telestai.LASKO"
+        let canonical = "LASKO_POST|\(contentHashHex)|\(timestampMs)|\(tlsAddress)|\(bundleId)|v1"
+        
+        defaults.removeObject(forKey: "lasko_post_sign_response")
+        defaults.synchronize()
+        
+        let requestDictionary: [String: Any] = [
+            "contentHashHex": contentHashHex,
+            "timestamp": timestampMs,
+            "tlsAddress": tlsAddress,
+            "bundleId": bundleId,
+            "canonical": canonical
+        ]
+        print("📤 LASKO: Writing post-sign request to App Groups...")
+        print("   Key: lasko_post_sign_request")
+        print("   Content hash: \(contentHashHex.prefix(16))...")
+        print("   Timestamp: \(timestampMs)")
+        print("   TLS Address: \(tlsAddress)")
+        defaults.set(requestDictionary, forKey: "lasko_post_sign_request")
+        let syncResult = defaults.synchronize()
+        print("✅ LASKO: Post-sign request written, sync result: \(syncResult)")
+        
+        // CRITICAL: Send Darwin notification to wake Zeroa
+        let notificationName = CFNotificationName("com.telestai.lasko.post.sign.request" as CFString)
+        CFNotificationCenterPostNotification(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            notificationName,
+            nil,
+            nil,
+            true
+        )
+        print("📢 LASKO: Sent Darwin notification to Zeroa")
+        
+        // Verify it was written
+        if let verify = defaults.dictionary(forKey: "lasko_post_sign_request") {
+            print("✅ LASKO: Verified request exists in App Groups after write")
+        } else {
+            print("❌ LASKO: WARNING - Request NOT found in App Groups immediately after write!")
+        }
+        
+        // Notification-driven polling with exponential backoff fallback
+        let maxWaitTime: TimeInterval = 6.0 // 6 seconds max
+        let startTime = Date()
+        var attempt = 0
+        
+        print("🔐 LASKO: Waiting for Zeroa signature for content hash \(contentHashHex.prefix(12))…")
+        
+        while Date().timeIntervalSince(startTime) < maxWaitTime {
+            // Check if notification was received or check App Groups
+            let freshDefaults = UserDefaults(suiteName: "group.com.telestai.zeroa-lasko")
+            freshDefaults?.synchronize()
+            defaults.synchronize()
+            
+            if let response = (freshDefaults?.dictionary(forKey: "lasko_post_sign_response") ?? defaults.dictionary(forKey: "lasko_post_sign_response")),
+               let signature = response["signatureBase64"] as? String,
+               let pubkey = response["pubkeyCompressedHex"] as? String {
+                print("✅ LASKO: Found Zeroa signature response!")
+                print("   Signature length: \(signature.count) chars")
+                print("   Public key: \(pubkey.prefix(16))...")
+                defaults.removeObject(forKey: "lasko_post_sign_request")
+                defaults.removeObject(forKey: "lasko_post_sign_response")
+                freshDefaults?.removeObject(forKey: "lasko_post_sign_request")
+                freshDefaults?.removeObject(forKey: "lasko_post_sign_response")
+                defaults.synchronize()
+                freshDefaults?.synchronize()
+                return ZeroaSignaturePayload(
+                    signatureBase64: signature,
+                    pubkeyCompressedHex: pubkey,
+                    canonicalMessage: canonical
+                )
+            }
+            
+            // Exponential backoff: 50ms, 100ms, 200ms, 400ms, then 400ms max
+            let delay = min(0.4, 0.05 * pow(2.0, Double(min(attempt, 3))))
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            attempt += 1
+            
+            if attempt % 10 == 0 {
+                let elapsed = Date().timeIntervalSince(startTime)
+                print("🔍 LASKO: Still waiting... (\(String(format: "%.1f", elapsed))s elapsed)")
+            }
+        }
+        
+        defaults.removeObject(forKey: "lasko_post_sign_request")
+        defaults.removeObject(forKey: "lasko_post_sign_response")
+        defaults.synchronize()
+        let elapsed = Date().timeIntervalSince(startTime)
+        print("❌ LASKO: Timed out waiting for Zeroa signature after \(String(format: "%.1f", elapsed))s")
+        return nil
+    }
+    
     func createComment(content: String, parentSequentialCode code: String) async -> Bool {
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
+        guard appGroupsService.isProfileActive() else {
+            print("❌ LASKO: Cannot create comment - Zeroa profile inactive")
+            return false
+        }
         // Ensure auth
         var tlsAddress = currentTLSAddress
         if !isAuthenticatedWithZeroa || (tlsAddress ?? "").isEmpty {
@@ -685,7 +1216,7 @@ class LASKOService: ObservableObject {
         guard isAuthenticatedWithZeroa, let tls = tlsAddress else { return false }
         guard let token = await ensureTokenForAddress(tls, timeoutSeconds: 5.0) else { return false }
         let allowed = CharacterSet.urlPathAllowed
-        guard let encoded = code.addingPercentEncoding(withAllowedCharacters: allowed) else { return false }
+        guard code.addingPercentEncoding(withAllowedCharacters: allowed) != nil else { return false }
         // Use the correct indexer endpoint: POST /posts with parentSequentialCode for replies
         guard let url = URL(string: "\(effectiveBaseURL)/posts") else { return false }
         do {
@@ -704,29 +1235,19 @@ class LASKOService: ObservableObject {
                 "postType": "free",
                 "parentSequentialCode": code  // This makes it a reply/comment
             ]
-            if let pubHex = appGroupsService.sharedDefaults?.string(forKey: "zeroa_pubkey_compressed_hex") {
-                body["pubkey"] = pubHex
+            guard let signaturePayload = await requestZeroaSignature(content: trimmed, tlsAddress: tls, timestampMs: nowMs) else {
+                print("❌ LASKO: Failed to obtain Zeroa signature for comment")
+                return false
             }
-            if body["signature"] == nil {
-                let contentHashHex = sha256Hex(of: Data(trimmed.utf8))
-                let signReq: [String: Any] = ["contentHashHex": contentHashHex, "timestamp": nowMs]
-                appGroupsService.sharedDefaults?.set(signReq, forKey: "lasko_post_sign_request")
-                appGroupsService.sharedDefaults?.synchronize()
-                var tries = 0
-                while tries < 100 { // Increased timeout for signature polling to 10s
-                    if let resp = appGroupsService.sharedDefaults?.dictionary(forKey: "lasko_post_sign_response"),
-                       let sig = resp["signatureBase64"] as? String,
-                       let pub = resp["pubkeyCompressedHex"] as? String {
-                        body["signature"] = sig
-                        body["pubkey"] = pub
-                        appGroupsService.sharedDefaults?.removeObject(forKey: "lasko_post_sign_response")
-                        break
-                    }
-                    tries += 1
-                    try? await Task.sleep(nanoseconds: 100_000_000)
-                }
-                guard body["signature"] != nil else { return false }
+            // Note: Pre-verification is optional - the server will verify on post creation
+            // The /halo/verify endpoint expects a nonce (for auth), not a message (for posts)
+            // So we skip verification here and let the server handle it
+            let verificationResult = await backendVerifySignature(address: tls, message: signaturePayload.canonicalMessage, signature: signaturePayload.signatureBase64)
+            if !verificationResult {
+                print("⚠️ LASKO: Pre-verification failed (expected for post signatures), proceeding with comment creation")
             }
+            body["signature"] = signaturePayload.signatureBase64
+            body["pubkey"] = signaturePayload.pubkeyCompressedHex
             print("🔗 LASKO: POST /posts (comment) parent=\(code) tls=\(tls) contentLen=\(trimmed.count)")
             req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [])
             let (data, response) = try await URLSession.shared.data(for: req)
@@ -765,17 +1286,10 @@ class LASKOService: ObservableObject {
         let zeroaVersion: String?
     }
     
-    struct LASKOPostSignature {
-        let publicKey: String
-        let signature: String
-        let timestamp: Int64
-    }
-    
-    private func signPost(_ content: String, address: String) -> LASKOPostSignature {
-        // Placeholder signing – replace with real signing when available
-        let ts = Int64(Date().timeIntervalSince1970 * 1000)
-        let sig = "mock-signature-\(ts)"
-        return LASKOPostSignature(publicKey: address, signature: sig, timestamp: ts)
+    private struct ZeroaSignaturePayload {
+        let signatureBase64: String
+        let pubkeyCompressedHex: String
+        let canonicalMessage: String
     }
     
     func createPost(content: String) async -> Bool {
@@ -789,6 +1303,10 @@ class LASKOService: ObservableObject {
         guard trimmed.count <= 1000 else { 
             print("❌ LASKO: createPost failed - content too long: \(trimmed.count)")
             return false 
+        }
+        guard appGroupsService.isProfileActive() else {
+            print("❌ LASKO: Cannot create post - Zeroa profile inactive")
+            return false
         }
         // Ensure auth: soft-recover from App Groups if in-memory flag is out-of-sync
         var tlsAddress = currentTLSAddress
@@ -815,12 +1333,16 @@ class LASKOService: ObservableObject {
             req.setValue("application/json", forHTTPHeaderField: "Accept")
             // Removed X-Moderation-Preview to enable live posting
             if let bundleId = Bundle.main.bundleIdentifier { req.setValue(bundleId, forHTTPHeaderField: "X-Bundle-Id") }
+#if DEBUG
             print("🔍 LASKO: Getting token for address: \(tlsAddress)")
+#endif
             guard let token = await ensureTokenForAddress(tlsAddress, timeoutSeconds: 8.0) else {
                 print("❌ LASKO: Cannot create post - missing or expired token")
                 return false
             }
+#if DEBUG
             print("✅ LASKO: Got token for post creation: \(String(token.prefix(20)))...")
+#endif
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
             // Pass TLS address as header for backend convenience
             req.setValue(tlsAddress, forHTTPHeaderField: "X-TLS-Address")
@@ -832,36 +1354,32 @@ class LASKOService: ObservableObject {
                 "postType": "free",
                 "timestamp": nowMs
             ]
-            if let pubHex = appGroupsService.sharedDefaults?.string(forKey: "zeroa_pubkey_compressed_hex") {
-                body["pubkey"] = pubHex
+            
+            // Include profile data if available
+            if let profileName = appGroupsService.getProfileDisplayName(), !profileName.isEmpty {
+                body["profileName"] = profileName
             }
-            // Try silent post-sign: request signature from Zeroa if not already present
-            if body["signature"] == nil {
-                print("🔍 LASKO: Requesting signature from Zeroa for post")
-                let contentHashHex = sha256Hex(of: Data(trimmed.utf8))
-                let signReq: [String: Any] = ["contentHashHex": contentHashHex, "timestamp": nowMs]
-                appGroupsService.sharedDefaults?.set(signReq, forKey: "lasko_post_sign_request")
-                appGroupsService.sharedDefaults?.synchronize()
-                // Poll briefly for response (up to 3s)
-                var tries = 0
-                while tries < 30 {
-                    if let resp = appGroupsService.sharedDefaults?.dictionary(forKey: "lasko_post_sign_response"),
-                       let sig = resp["signatureBase64"] as? String,
-                       let pub = resp["pubkeyCompressedHex"] as? String {
-                        body["signature"] = sig
-                        body["pubkey"] = pub
-                        appGroupsService.sharedDefaults?.removeObject(forKey: "lasko_post_sign_response")
-                break
+            // Include profile image if available
+            if let profileImage = appGroupsService.getProfileImage(),
+               let imageData = profileImage.jpegData(compressionQuality: 0.7) {
+                let base64String = imageData.base64EncodedString()
+                body["profileImageBase64"] = base64String
             }
-                    tries += 1
-                    try? await Task.sleep(nanoseconds: 100_000_000)
-                }
-                guard body["signature"] != nil else { 
-                    print("❌ LASKO: Failed to get signature from Zeroa after 3s")
-                    return false 
-                }
-                print("✅ LASKO: Got signature from Zeroa for post")
+            // Note: Bio can be added later when we have a bio field in App Groups
+            print("🔍 LASKO: Requesting signature from Zeroa for post")
+            guard let signaturePayload = await requestZeroaSignature(content: trimmed, tlsAddress: tlsAddress, timestampMs: nowMs) else {
+                print("❌ LASKO: Failed to obtain Zeroa signature for post")
+                return false
             }
+            // Note: Pre-verification is optional - the server will verify on post creation
+            // The /halo/verify endpoint expects a nonce (for auth), not a message (for posts)
+            // So we skip verification here and let the server handle it
+            let verificationResult = await backendVerifySignature(address: tlsAddress, message: signaturePayload.canonicalMessage, signature: signaturePayload.signatureBase64)
+            if !verificationResult {
+                print("⚠️ LASKO: Pre-verification failed (expected for post signatures), proceeding with post creation")
+            }
+            body["signature"] = signaturePayload.signatureBase64
+            body["pubkey"] = signaturePayload.pubkeyCompressedHex
             let payload = body
             req.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [])
             print("🔗 LASKO: POST /posts base=\(effectiveBaseURL) tls=\(tlsAddress) contentLen=\(trimmed.count)")
@@ -940,6 +1458,118 @@ class LASKOService: ObservableObject {
         }
     }
     
+    func rewardPost(_ post: Post, amount: Double = 10.0) async -> Bool {
+        guard let tls = (currentTLSAddress ?? appGroupsService.getTLSAddress()), !tls.isEmpty else {
+            print("❌ LASKO: rewardPost failed - no TLS address")
+            return false
+        }
+        
+        guard let token = await ensureTokenForAddress(tls, timeoutSeconds: 5.0) else {
+            print("❌ LASKO: rewardPost failed - no token")
+            return false
+        }
+        
+        do {
+            // URL-encode the post ID to handle special characters like #
+            guard let encodedPostId = post.id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else {
+                print("❌ LASKO: rewardPost failed - cannot encode post ID")
+                return false
+            }
+            let url = URL(string: "\(effectiveBaseURL)/posts/\(encodedPostId)/reward")!
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            request.setValue(tls, forHTTPHeaderField: "X-TLS-Address")
+            if let bundleId = Bundle.main.bundleIdentifier {
+                request.setValue(bundleId, forHTTPHeaderField: "X-Bundle-Id")
+            }
+            
+            let body: [String: Any] = [
+                "fromAddress": tls,
+                "amount": amount
+            ]
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            
+            let (data, response) = try await URLSession.shared.data(for: request)
+            
+            if let http = response as? HTTPURLResponse {
+                if http.statusCode == 200 {
+                    if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let success = json["success"] as? Bool, success,
+                       let dataObj = json["data"] as? [String: Any],
+                       let tlsCount = dataObj["tlsCount"] as? Int {
+                        print("✅ LASKO: Post rewarded successfully, new TLS count: \(tlsCount)")
+                        
+                        // Update local post with new TLS count
+                        DispatchQueue.main.async {
+                            if let index = self.posts.firstIndex(where: { $0.id == post.id }) {
+                                var updatedPost = self.posts[index]
+                                self.posts[index] = Post(
+                                    id: updatedPost.id,
+                                    content: updatedPost.content,
+                                    author: updatedPost.author,
+                                    timestamp: updatedPost.timestamp,
+                                    likes: updatedPost.likes,
+                                    replies: updatedPost.replies,
+                                    isLiked: updatedPost.isLiked,
+                                    userRank: updatedPost.userRank,
+                                    avatarURL: updatedPost.avatarURL,
+                                    parentCode: updatedPost.parentCode,
+                                    tlsAddress: updatedPost.tlsAddress,
+                                    broadcastCount: updatedPost.broadcastCount,
+                                    tlsCount: tlsCount,
+                                    followerCount: updatedPost.followerCount
+                                )
+                            }
+                        }
+                        
+                        // Request Zeroa to send TLS payment (background)
+                        await requestZeroaTLSPayment(toAddress: post.tlsAddress ?? "", amount: amount, postId: post.id)
+                        
+                        return true
+                    }
+                } else {
+                    let body = String(data: data, encoding: .utf8) ?? ""
+                    print("❌ LASKO: rewardPost server error: \(http.statusCode) \(body)")
+                }
+            }
+            return false
+        } catch {
+            print("❌ LASKO: rewardPost error: \(error)")
+            return false
+        }
+    }
+    
+    private func requestZeroaTLSPayment(toAddress: String, amount: Double, postId: String) async {
+        guard let defaults = appGroupsService.sharedDefaults else {
+            print("❌ LASKO: Cannot request TLS payment - App Groups unavailable")
+            return
+        }
+        
+        let request: [String: Any] = [
+            "toAddress": toAddress,
+            "amount": amount,
+            "postId": postId,
+            "timestamp": Int(Date().timeIntervalSince1970 * 1000)
+        ]
+        
+        defaults.set(request, forKey: "lasko_tls_payment_request")
+        defaults.synchronize()
+        
+        print("📤 LASKO: Requested Zeroa to send TLS payment: \(amount) TLS to \(toAddress) for post \(postId)")
+        
+        // Send Darwin notification to Zeroa
+        let notificationName = CFNotificationName("com.telestai.lasko.tls.payment.request" as CFString)
+        CFNotificationCenterPostNotification(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            notificationName,
+            nil,
+            nil,
+            true
+        )
+    }
+    
     // Helper function to find the main post code for a given comment
     private func getMainPostCode(forCommentCode commentCode: String) -> String? {
         // First, check if this comment is directly under a main post
@@ -1003,15 +1633,7 @@ class LASKOService: ObservableObject {
     }
     
     func verifyMessage(message: String, signature: String, address: String) async -> Bool {
-        // Placeholder for future implementation
-        return false
-    }
-
-    private func verifySignature(address: String, message: String, signature: String) async -> Bool {
-        // For now, defer to backend verification when available; if not, return true to unblock
-        // TODO: Replace with call to Indexer verify endpoint for message/signature
-        // let ok = await Backend.verify(address: address, message: message, signature: signature)
-        return true
+        await backendVerifySignature(address: address, message: message, signature: signature)
     }
     
     // MARK: - Username Management
@@ -1026,10 +1648,20 @@ class LASKOService: ObservableObject {
             print("✅ LASKO: Address matches current user, returning username: \(username)")
             return username
         }
-        // For other users, return a shortened version of their address
-        let displayName = address.isEmpty ? "User" : String(address.prefix(8)) + "..."
-        print("✅ LASKO: Address is different user, returning shortened: \(displayName)")
+        // For other users, return the full address (no ellipsis)
+        let displayName = address.isEmpty ? "User" : address
+        print("✅ LASKO: Address is different user, returning full address: \(displayName)")
         return displayName
+    }
+    
+    // Format TLS address as first 5 chars + "..." + last 7 chars
+    func formatTLSAddress(_ address: String?) -> String {
+        guard let addr = address, !addr.isEmpty else { return "" }
+        guard addr.count > 12 else { return addr } // If address is too short, return as-is
+        
+        let firstFive = String(addr.prefix(5))
+        let lastSeven = String(addr.suffix(7))
+        return "\(firstFive)...\(lastSeven)"
     }
 }
 

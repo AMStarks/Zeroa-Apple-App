@@ -2,6 +2,8 @@ import SwiftUI
 // import WebRTC  // Temporarily disabled for simulator testing
 
 struct HybridMessagingView: View {
+    var showsBackButton: Bool = true
+    var onBack: (() -> Void)?
     @StateObject private var p2pService = TLSLayer2MessagingService.shared
     // @StateObject private var webRTCManager = WebRTCConnectionManager.shared  // Temporarily disabled
     @State private var selectedTab = 0
@@ -21,64 +23,52 @@ struct HybridMessagingView: View {
     @State private var showP2PConnectionStatus = false
     @Environment(\.dismiss) private var dismiss
     
+    private func handleBack() {
+        if let onBack = onBack {
+            onBack()
+        } else {
+            dismiss()
+            NotificationCenter.default.post(name: .zeroaNavigateToProfile, object: nil)
+        }
+    }
+    
     var body: some View {
         ZStack {
             DesignSystem.Colors.background
                 .ignoresSafeArea()
             
             VStack(spacing: 0) {
-                // Header with Back Button
-                HStack {
-                    Button(action: {
-                        dismiss()
-                    }) {
-                        HStack(spacing: DesignSystem.Spacing.xs) {
-                            Image(systemName: "chevron.left")
-                                .font(.system(size: 16, weight: .medium))
-                            Text("Back")
-                                .font(DesignSystem.Typography.bodyMedium)
+                HeaderBar(
+                    title: "Switchboard",
+                    leading: {
+                        if showsBackButton {
+                            Button(action: handleBack) {
+                                HStack(spacing: DesignSystem.Spacing.xs) {
+                                    Image(systemName: "chevron.left")
+                                        .font(.system(size: 16, weight: .medium))
+                                    Text("Back")
+                                        .font(DesignSystem.Typography.bodyMedium)
+                                }
+                                .foregroundColor(DesignSystem.Colors.secondary)
+                            }
+                        } else {
+                            Circle()
+                                .fill(Color.clear)
+                                .frame(width: 44, height: 44)
                         }
-                        .foregroundColor(DesignSystem.Colors.secondary)
-                    }
-                    
-                    Spacer()
-                    
-                    Text("Switchboard")
-                        .font(DesignSystem.Typography.titleMedium)
-                        .foregroundColor(DesignSystem.Colors.text)
-                    
-                    Spacer()
-                    
-                    // Connection Status
-                    HStack(spacing: DesignSystem.Spacing.sm) {
+                    },
+                    trailing: {
                         Circle()
                             .fill(p2pService.isConnected ? Color.green : Color.red)
-                            .frame(width: 8, height: 8)
-                        
-                        Text(p2pService.connectionStatus)
-                            .font(DesignSystem.Typography.bodySmall)
-                            .foregroundColor(DesignSystem.Colors.textSecondary)
-                        
-                        // P2P Connection Indicator (temporarily disabled)
-                        /*
-                        if webRTCManager.isConnected {
-                            Circle()
-                                .fill(Color.blue)
-                                .frame(width: 8, height: 8)
-                            
-                            Text("P2P")
-                                .font(DesignSystem.Typography.bodySmall)
-                                .foregroundColor(DesignSystem.Colors.textSecondary)
-                        }
-                        */
+                            .frame(width: 10, height: 10)
+                            .padding(.leading, DesignSystem.Spacing.sm)
+                            .padding(.trailing, DesignSystem.Spacing.xs)
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                showP2PConnectionStatus = true
+                            }
                     }
-                    .onTapGesture {
-                        showP2PConnectionStatus = true
-                    }
-                }
-                .padding(.horizontal, DesignSystem.Spacing.lg)
-                .padding(.vertical, DesignSystem.Spacing.md)
-                .background(DesignSystem.Colors.surface)
+                )
                 
                 // Tab Selector
                 CustomSegmentedPicker(selection: $selectedTab)

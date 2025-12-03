@@ -11,6 +11,10 @@ struct LASKOApp: App {
             ContentView()
                 .environmentObject(laskoService)
                 .environmentObject(authUIState)
+                .task {
+                    // Pre-warm Halo token to reduce latency for upcoming fetches
+                    await laskoService.prewarmHaloTokenIfPossible()
+                }
                 // Re-enabled deep link callback and foreground listeners
                 .onOpenURL { url in
                     // Expecting: lasko://auth/callback

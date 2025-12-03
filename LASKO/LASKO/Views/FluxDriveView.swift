@@ -20,16 +20,14 @@ struct FluxDriveView: View {
                     .ignoresSafeArea()
 
                 VStack(spacing: 20) {
-                    // Header with Flux logo
+                    // Header with Storage logo
                     HStack(spacing: 12) {
-                        Image("FluxIcon")
-                            .resizable()
-                            .renderingMode(.original)
-                            .aspectRatio(contentMode: .fit)
-                            .frame(width: 28, height: 28)
+                        Image(systemName: "externaldrive.fill")
+                            .font(.system(size: 28, weight: .semibold))
+                            .foregroundColor(.white)
 
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("FluxDrive")
+                            Text("Storage")
                                 .font(.system(size: 18, weight: .semibold))
                                 .foregroundColor(.white)
                             Text("Decentralized storage")
@@ -51,11 +49,11 @@ struct FluxDriveView: View {
                     // Usage card
                     VStack(alignment: .leading, spacing: 16) {
                         HStack {
-                            Image(systemName: "externaldrive.fill")
+                            Image(systemName: "battery.50")
                                 .font(.system(size: 26))
                                 .foregroundColor(Color(red: 1.0, green: 0.6, blue: 0.0))
 
-                            Text("Storage Usage")
+                            Text("Usage")
                                 .font(.system(size: 18, weight: .semibold))
                                 .foregroundColor(.white)
                         }
@@ -119,7 +117,7 @@ struct FluxDriveView: View {
                                 .labelsHidden()
                         }
 
-                        Text("Keep your posts and media synchronized with FluxDrive across devices.")
+                        Text("Keep your posts and media synchronized across devices.")
                             .foregroundColor(.white.opacity(0.75))
                             .font(.system(size: 14))
                     }
@@ -205,10 +203,6 @@ private struct UpgradeButton: View {
 @ViewBuilder
 private func upgradeRow(tier: String, size: String, price: String) -> some View {
     HStack {
-        Image("FluxIcon")
-            .resizable()
-            .aspectRatio(contentMode: .fit)
-            .frame(width: 18, height: 18)
         VStack(alignment: .leading, spacing: 4) {
             Text("\(tier) — \(size)")
                 .foregroundColor(.white)

@@ -2,6 +2,58 @@ import Foundation
 import Combine
 import Network
 
+private struct MessagingEndpointResolver {
+    private let environmentKey = "L2_MESSAGING_BASE_URL"
+    private let defaultRestBase = "https://halo.telestai.io"
+    
+    func restBaseURLString() -> String {
+        let override = ProcessInfo.processInfo.environment[environmentKey]
+        let candidate = override?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? defaultRestBase
+        return candidate.removingTrailingSlash()
+    }
+    
+    func websocketBaseURLString() -> String {
+        let restString = restBaseURLString()
+        guard var comps = URLComponents(string: restString) else {
+            return restString.removingTrailingSlash().appendingPathComponentIfNeeded("ws")
+        }
+        if let scheme = comps.scheme?.lowercased() {
+            if scheme == "https" {
+                comps.scheme = "wss"
+            } else if scheme == "http" {
+                comps.scheme = "ws"
+            }
+        }
+        guard let base = comps.url?.absoluteString else {
+            return restString.removingTrailingSlash().appendingPathComponentIfNeeded("ws")
+        }
+        return base.removingTrailingSlash().appendingPathComponentIfNeeded("ws")
+    }
+    
+    func websocketURL(for address: String) -> URL? {
+        let base = websocketBaseURLString()
+        let encoded = address.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? address
+        let separator = base.hasSuffix("/") ? "" : "/"
+        return URL(string: "\(base)\(separator)\(encoded)")
+    }
+}
+
+private extension String {
+    func removingTrailingSlash() -> String {
+        guard hasSuffix("/") else { return self }
+        return String(dropLast())
+    }
+    
+    func appendingPathComponentIfNeeded(_ component: String) -> String {
+        let trimmed = removingTrailingSlash()
+        return "\(trimmed)/\(component)"
+    }
+    
+    var nonEmpty: String? {
+        isEmpty ? nil : self
+    }
+}
+
 class TLSLayer2MessagingService: ObservableObject {
     static let shared = TLSLayer2MessagingService()
     
@@ -13,59 +65,145 @@ class TLSLayer2MessagingService: ObservableObject {
     
     private var cancellables = Set<AnyCancellable>()
     private let walletService = WalletService.shared
+    private let haloAPI = HaloAPIService.shared
+    private let endpointResolver = MessagingEndpointResolver()
+    private lazy var restBaseURLString = endpointResolver.restBaseURLString()
+    private lazy var websocketBaseURLString = endpointResolver.websocketBaseURLString()
+    private var accountActivationObserver: NSObjectProtocol?
     private var webSocketTask: URLSessionWebSocketTask?
-    private let serverURL = "http://43.224.35.187:8000"
-    private let wsURL = "ws://43.224.35.187:8000/ws"
+    private let isMessagingFeatureEnabled: Bool = TLSLayer2MessagingService.messagingFeatureEnabled()
+    
+    private var isProfileActive: Bool {
+        AppGroupsService.shared.isProfileActive()
+    }
     
     init() {
         setupMockData() // Keep some initial data for UI
+        accountActivationObserver = NotificationCenter.default.addObserver(
+            forName: .zeroaAccountActivationChanged,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let isActive = notification.userInfo?["isActive"] as? Bool else { return }
+            self?.handleAccountActivationChange(isActive: isActive)
+        }
         startConnection()
     }
     
     private func setupMockData() {
         // Initial mock data for UI testing
-        contacts = [
-            P2PContact(name: "Alice", address: "alice123", publicKey: "pubkey1", isOnline: true),
-            P2PContact(name: "Bob", address: "bob456", publicKey: "pubkey2", isOnline: false),
-            P2PContact(name: "Charlie", address: "charlie789", publicKey: "pubkey3", isOnline: true)
-        ]
-        
-        conversations = [
-            P2PConversation(contactId: "alice123", contactName: "Alice", lastMessage: "Hey, how are you?", unreadCount: 2),
-            P2PConversation(contactId: "bob456", contactName: "Bob", lastMessage: "Thanks for the help!", unreadCount: 0),
-            P2PConversation(contactId: "charlie789", contactName: "Charlie", lastMessage: "See you later!", unreadCount: 1)
-        ]
-        
-        messages = [
-            P2PMessage(senderId: "alice123", receiverId: "self", content: "Hey, how are you?"),
-            P2PMessage(senderId: "self", receiverId: "alice123", content: "I'm good, thanks!"),
-            P2PMessage(senderId: "bob456", receiverId: "self", content: "Thanks for the help!"),
-            P2PMessage(senderId: "charlie789", receiverId: "self", content: "See you later!")
-        ]
+        DispatchQueue.main.async {
+            self.contacts = [
+                P2PContact(name: "Alice", address: "alice123", publicKey: "pubkey1", isOnline: true),
+                P2PContact(name: "Bob", address: "bob456", publicKey: "pubkey2", isOnline: false),
+                P2PContact(name: "Charlie", address: "charlie789", publicKey: "pubkey3", isOnline: true)
+            ]
+            
+            self.conversations = [
+                P2PConversation(contactId: "alice123", contactName: "Alice", lastMessage: "Hey, how are you?", unreadCount: 2),
+                P2PConversation(contactId: "bob456", contactName: "Bob", lastMessage: "Thanks for the help!", unreadCount: 0),
+                P2PConversation(contactId: "charlie789", contactName: "Charlie", lastMessage: "See you later!", unreadCount: 1)
+            ]
+            
+            self.messages = [
+                P2PMessage(senderId: "alice123", receiverId: "self", content: "Hey, how are you?"),
+                P2PMessage(senderId: "self", receiverId: "alice123", content: "I'm good, thanks!"),
+                P2PMessage(senderId: "bob456", receiverId: "self", content: "Thanks for the help!"),
+                P2PMessage(senderId: "charlie789", receiverId: "self", content: "See you later!")
+            ]
+        }
     }
     
     func startConnection() {
-        // Connect to WebSocket for real-time messaging
+        guard isMessagingFeatureEnabled else {
+            suspendConnection(reason: "Halo messaging offline")
+            return
+        }
+        guard isProfileActive else {
+            suspendConnection(reason: "Inactive")
+            return
+        }
+        Task {
+            await HaloService.shared.ensureToken()
+            await MainActor.run { [weak self] in
+                self?.openMessagingChannels()
+            }
+        }
+    }
+    
+    private func openMessagingChannels() {
+        guard isMessagingFeatureEnabled else {
+            suspendConnection(reason: "Halo messaging offline")
+            return
+        }
+        guard isProfileActive else {
+            suspendConnection(reason: "Inactive")
+            return
+        }
         connectWebSocket()
-        
-        // Register with server
         registerPeer()
-        
-        // Discover peers
         discoverPeers()
-        
-        // Load message history
         loadMessageHistory()
     }
     
+    private func handleAccountActivationChange(isActive: Bool) {
+        if isActive {
+            startConnection()
+        } else {
+            suspendConnection(reason: "Inactive")
+        }
+    }
+    
+    private func suspendConnection(reason: String) {
+        webSocketTask?.cancel(with: .goingAway, reason: nil)
+        webSocketTask = nil
+        DispatchQueue.main.async {
+            self.isConnected = false
+            self.connectionStatus = reason
+        }
+    }
+    
+    private func currentHaloToken() -> String? {
+        haloAPI.storedToken()?.token
+    }
+    
+    private func makeSessionConfiguration() -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.default
+        configuration.waitsForConnectivity = true
+        configuration.timeoutIntervalForRequest = 20
+        configuration.timeoutIntervalForResource = 40
+        return configuration
+    }
+    
     private func connectWebSocket() {
-        guard let url = URL(string: "\(wsURL)/\(walletService.loadAddress() ?? "")") else {
+        guard isMessagingFeatureEnabled else { return }
+        guard isProfileActive else { return }
+        guard let address = walletService.loadAddress(), !address.isEmpty else {
+            print("❌ WebSocket connection aborted - missing TLS address")
+            return
+        }
+        guard let token = currentHaloToken() else {
+            print("❌ WebSocket connection aborted - missing Halo token")
+            return
+        }
+        guard let url = endpointResolver.websocketURL(for: address) else {
             print("❌ Invalid WebSocket URL")
             return
         }
         
-        let session = URLSession(configuration: .default)
-        webSocketTask = session.webSocketTask(with: url)
+        DispatchQueue.main.async {
+            self.connectionStatus = "Connecting..."
+        }
+        
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 20
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let bundleId = Bundle.main.bundleIdentifier {
+            request.setValue(bundleId, forHTTPHeaderField: "X-Bundle-Id")
+        }
+        
+        let session = URLSession(configuration: makeSessionConfiguration())
+        webSocketTask = session.webSocketTask(with: request)
         webSocketTask?.resume()
         
         receiveMessage()
@@ -85,7 +223,9 @@ class TLSLayer2MessagingService: ObservableObject {
             case .failure(let error):
                 print("❌ WebSocket receive error: \(error)")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-                    self?.connectWebSocket() // Reconnect
+                    guard let strongSelf = self, strongSelf.isProfileActive else { return }
+                    strongSelf.connectionStatus = "Reconnecting..."
+                    strongSelf.connectWebSocket()
                 }
             }
         }
@@ -123,6 +263,7 @@ class TLSLayer2MessagingService: ObservableObject {
     }
     
     private func registerPeer() {
+        guard isMessagingFeatureEnabled else { return }
         guard let address = walletService.loadAddress() else { return }
         
         let peerData: [String: Any] = [
@@ -135,7 +276,9 @@ class TLSLayer2MessagingService: ObservableObject {
         sendAPIRequest(endpoint: "/api/v1/peer/register", method: "POST", data: peerData) { [weak self] result in
             switch result {
             case .success(let response):
+#if DEBUG
                 print("✅ Peer registered: \(response)")
+#endif
             case .failure(let error):
                 print("❌ Peer registration failed: \(error)")
             }
@@ -143,6 +286,7 @@ class TLSLayer2MessagingService: ObservableObject {
     }
     
     private func discoverPeers() {
+        guard isMessagingFeatureEnabled else { return }
         guard let address = walletService.loadAddress() else { return }
         
         sendAPIRequest(endpoint: "/api/v1/peers/discover?address=\(address)", method: "GET") { [weak self] result in
@@ -172,6 +316,7 @@ class TLSLayer2MessagingService: ObservableObject {
     }
     
     private func loadMessageHistory() {
+        guard isMessagingFeatureEnabled else { return }
         guard let address = walletService.loadAddress() else { return }
         
         sendAPIRequest(endpoint: "/api/v1/messages/\(address)", method: "GET") { [weak self] result in
@@ -205,20 +350,39 @@ class TLSLayer2MessagingService: ObservableObject {
     }
     
     private func sendAPIRequest(endpoint: String, method: String, data: [String: Any]? = nil, completion: @escaping (Result<Any, Error>) -> Void) {
-        guard let url = URL(string: "\(serverURL)\(endpoint)") else {
-            completion(.failure(NSError(domain: "Invalid URL", code: -1)))
+        guard isMessagingFeatureEnabled else {
+            completion(.failure(NSError(domain: "MessagingService", code: -13, userInfo: [NSLocalizedDescriptionKey: "Halo messaging disabled"])))
+            return
+        }
+        guard isProfileActive else {
+            completion(.failure(NSError(domain: "MessagingService", code: -10, userInfo: [NSLocalizedDescriptionKey: "Account inactive"])))
+            return
+        }
+        guard let token = currentHaloToken() else {
+            completion(.failure(NSError(domain: "MessagingService", code: -11, userInfo: [NSLocalizedDescriptionKey: "Missing Halo token"])))
+            return
+        }
+        let urlString = "\(restBaseURLString)\(endpoint)"
+        guard let url = URL(string: urlString) else {
+            completion(.failure(NSError(domain: "MessagingService", code: -12, userInfo: [NSLocalizedDescriptionKey: "Invalid URL"])))
             return
         }
         
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let bundleId = Bundle.main.bundleIdentifier {
+            request.setValue(bundleId, forHTTPHeaderField: "X-Bundle-Id")
+        }
+        request.timeoutInterval = 20
         
         if let data = data {
             request.httpBody = try? JSONSerialization.data(withJSONObject: data)
         }
         
-        URLSession.shared.dataTask(with: request) { data, response, error in
+        let session = URLSession(configuration: makeSessionConfiguration())
+        session.dataTask(with: request) { data, response, error in
             if let error = error {
                 completion(.failure(error))
                 return
@@ -239,6 +403,10 @@ class TLSLayer2MessagingService: ObservableObject {
     }
     
     func sendMessage(to contactId: String, content: String) {
+        guard isMessagingFeatureEnabled else {
+            print("⚠️ Messaging disabled - cannot send message.")
+            return
+        }
         guard let senderAddress = walletService.loadAddress() else { return }
         
         let messageData: [String: Any] = [
@@ -252,7 +420,9 @@ class TLSLayer2MessagingService: ObservableObject {
         sendAPIRequest(endpoint: "/api/v1/message/relay", method: "POST", data: messageData) { [weak self] result in
             switch result {
             case .success(let response):
+#if DEBUG
                 print("✅ Message sent: \(response)")
+#endif
                 
                 // Add message locally
                 let message = P2PMessage(senderId: senderAddress, receiverId: contactId, content: content)
@@ -334,6 +504,7 @@ class TLSLayer2MessagingService: ObservableObject {
     }
     
     func sendP2PMessage(to contactId: String, content: String) async -> Bool {
+        guard isMessagingFeatureEnabled else { return false }
         sendMessage(to: contactId, content: content)
         return true
     }
@@ -372,6 +543,17 @@ class TLSLayer2MessagingService: ObservableObject {
     }
     
     deinit {
-        webSocketTask?.cancel()
+        if let observer = accountActivationObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        webSocketTask?.cancel(with: .goingAway, reason: nil)
+    }
+    
+    private static func messagingFeatureEnabled() -> Bool {
+#if DEBUG
+        return ProcessInfo.processInfo.environment["ZEROA_ENABLE_HALO_MESSAGING"] == "1"
+#else
+        return false
+#endif
     }
 }

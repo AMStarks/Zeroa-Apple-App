@@ -60,7 +60,7 @@ class LASKOAuthService: ObservableObject {
     }
     
     func getAuthResponseFromZeroa() -> LASKOAuthSession? {
-        print("🔍 Checking for completed LASKO auth response...")
+        // Removed excessive logging - only log when response is found
         return AppGroupsService.shared.getLASKOAuthResponse()
     }
     

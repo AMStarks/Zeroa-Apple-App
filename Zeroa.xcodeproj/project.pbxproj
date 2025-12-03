@@ -8,12 +8,12 @@
 
 /* Begin PBXBuildFile section */
 		036543CAB4F93C93996DA4B8 /* Pods_ZeroaTests.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 30C81F352212A2AF8DA40681 /* Pods_ZeroaTests.framework */; };
-		778C1213721B3453396C25E0 /* Pods_Zeroa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 046931055CB1555E41B1E172 /* Pods_Zeroa.framework */; };
 		847E3FE62E5D083F00D9A69C /* P256K in Frameworks */ = {isa = PBXBuildFile; productRef = 847E3FE52E5D083F00D9A69C /* P256K */; };
 		84FDE9F52E2674140043C535 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 84FDE9F42E2674140043C535 /* WebKit.framework */; };
 		84FDE9F92E26772E0043C535 /* EventKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 84FDE9F82E26772E0043C535 /* EventKit.framework */; };
 		84FDE9FB2E2677330043C535 /* MapKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 84FDE9FA2E2677330043C535 /* MapKit.framework */; };
 		B082587E3DD11EBB9D265605 /* Pods_ZeroaUITests.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 72845BB10E76813EF800A0B4 /* Pods_ZeroaUITests.framework */; };
+		F0DE8A5855F274A9B00011BC /* Pods_Zeroa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 046931055CB1555E41B1E172 /* Pods_Zeroa.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -92,7 +92,7 @@
 				84FDE9F92E26772E0043C535 /* EventKit.framework in Frameworks */,
 				84FDE9FB2E2677330043C535 /* MapKit.framework in Frameworks */,
 				84FDE9F52E2674140043C535 /* WebKit.framework in Frameworks */,
-
+				F0DE8A5855F274A9B00011BC /* Pods_Zeroa.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -63,23 +63,36 @@ struct ModernPostComposerView: View {
                     .padding(.top, 12)
                     .padding(.bottom, 10)
 
-                    // Avatar + Editor inline
-                    HStack(alignment: .top, spacing: 10) {
-                        ZStack {
-                            Circle().fill(LinearGradient(colors: [Color(red:1, green:0.6, blue:0), Color(red:1, green:0.4, blue:0)], startPoint: .topLeading, endPoint: .bottomTrailing))
-                                .frame(width: 36, height: 36)
-                            Text(String(author.prefix(1)))
-                                .font(.system(size: 15, weight: .bold))
-                                .foregroundColor(.white)
+                    // Avatar at top, Editor expands full width underneath
+                    VStack(alignment: .leading, spacing: 0) {
+                        // Avatar positioned at top left
+                        HStack(alignment: .top, spacing: 0) {
+                            ZStack {
+                                if let profileImage = AppGroupsService.shared.getProfileImage() {
+                                    Image(uiImage: profileImage)
+                                        .resizable()
+                                        .scaledToFill()
+                                        .frame(width: 36, height: 36)
+                                        .clipShape(Circle())
+                                } else {
+                                    Circle().fill(LinearGradient(colors: [Color(red:1, green:0.6, blue:0), Color(red:1, green:0.4, blue:0)], startPoint: .topLeading, endPoint: .bottomTrailing))
+                                        .frame(width: 36, height: 36)
+                                    Text(String(author.prefix(1)))
+                                        .font(.system(size: 15, weight: .bold))
+                                        .foregroundColor(.white)
+                                }
+                            }
+                            Spacer()
                         }
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 8)
+                        
+                        // Text Editor expands full width, starting from left edge
                         ZStack(alignment: .topLeading) {
-                            // Editor width: min(containerWidth, available screen width minus margins + avatar)
-                            let available = geo.size.width - 16 - 36 - 10 - 16
-                            let editorWidth = max(200, min(containerWidth, available))
                             RichTextEditor(attributedText: $attributedText, controller: richController, placeholder: "Tell your story...")
                                 .frame(minHeight: 210)
-                                .frame(width: editorWidth, alignment: .leading)
-                                .padding(.horizontal, 0)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 16)
                                 .padding(.vertical, 0)
                                 .background(Color.white)
                             if attributedText.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -87,11 +100,10 @@ struct ModernPostComposerView: View {
                                     .font(.system(size: 22, weight: .regular))
                                     .foregroundColor(Color.gray.opacity(0.6))
                                     .padding(.top, 12)
-                                    .padding(.leading, 10)
+                                    .padding(.leading, 26) // 16px padding + 10px offset
                             }
                         }
                     }
-                    .padding(.horizontal, 16)
                     .padding(.bottom, 8)
 
                     // Attachments
@@ -117,7 +129,7 @@ struct ModernPostComposerView: View {
                                 }
                                 if let date = scheduledDate { HStack(spacing: 6) { Image(systemName: "calendar.badge.clock").foregroundColor(.black); Text(date.formatted(date: .abbreviated, time: .shortened)) }.font(.caption).padding(8).background(Color.gray.opacity(0.15)).cornerRadius(8) }
                             }
-                            .padding(.leading, 16 + 36 + 10)
+                            .padding(.leading, 16)
                             .padding(.trailing, 16)
                         }
                         .padding(.top, 6)

@@ -1,5 +1,9 @@
 import SwiftUI
 
+// Maximum comment nesting depth (0 = post, 1 = nest 1, 2 = nest 2)
+// To change: update MAX_COMMENT_DEPTH constant below
+private let MAX_COMMENT_DEPTH = 2
+
 struct CommentsView: View {
     let postId: String
     let sequentialCode: String?
@@ -16,9 +20,17 @@ struct CommentsView: View {
     @State private var promotedComment: Post? = nil // Track which comment is promoted to top
     
     private func formatTimestamp(_ date: Date) -> String {
+        // Guard against invalid dates
+        let now = Date()
+        let timeInterval = now.timeIntervalSince(date)
+        guard timeInterval.isFinite && !timeInterval.isNaN,
+              date.timeIntervalSince1970.isFinite && !date.timeIntervalSince1970.isNaN else {
+            return "now"
+        }
+        
         let f = RelativeDateTimeFormatter()
         f.unitsStyle = .abbreviated
-        return f.localizedString(for: date, relativeTo: Date())
+        return f.localizedString(for: date, relativeTo: now)
     }
 
     var body: some View {
@@ -92,7 +104,7 @@ struct CommentsView: View {
                                     .buttonStyle(PlainButtonStyle())
 
                                     // TLS
-                                    TelestaiRewardActionButton()
+                                    TelestaiRewardActionButton(post: promoted, laskoService: laskoService)
                                         .scaleEffect(0.8)
 
                                     Spacer()
@@ -418,7 +430,7 @@ struct OriginalPostCard: View {
                 .buttonStyle(PlainButtonStyle())
                 
                 // TLS button - using the proper component
-                TelestaiRewardActionButton()
+                TelestaiRewardActionButton(post: post, laskoService: laskoService)
                 
                 Spacer()
                 
@@ -449,9 +461,17 @@ struct OriginalPostCard: View {
     }
     
     private func formatTimestamp(_ date: Date) -> String {
+        // Guard against invalid dates
+        let now = Date()
+        let timeInterval = now.timeIntervalSince(date)
+        guard timeInterval.isFinite && !timeInterval.isNaN,
+              date.timeIntervalSince1970.isFinite && !date.timeIntervalSince1970.isNaN else {
+            return "now"
+        }
+        
         let f = RelativeDateTimeFormatter()
         f.unitsStyle = .abbreviated
-        return f.localizedString(for: date, relativeTo: Date())
+        return f.localizedString(for: date, relativeTo: now)
     }
 }
 
@@ -555,12 +575,12 @@ struct CommentRow: View {
                         .buttonStyle(PlainButtonStyle())
                         
                         // TLS button - using the proper component
-                        TelestaiRewardActionButton()
+                        TelestaiRewardActionButton(post: comment, laskoService: laskoService)
                             .scaleEffect(0.8) // Make it smaller for comments
                         
-                        // See more button for nested comments (only show if there are children and depth < 5)
+                        // See more button for nested comments (only show if there are children and depth < MAX_COMMENT_DEPTH)
                         let childrenCount = (laskoService.repliesByCode[comment.id] ?? []).count
-                        if childrenCount > 0 && depth < 5 {
+                        if childrenCount > 0 && depth < MAX_COMMENT_DEPTH {
                             Button(action: {
                                 withAnimation(.easeInOut(duration: 0.3)) {
                                     // Add current promoted comment to history before promoting new one
@@ -620,9 +640,17 @@ struct CommentRow: View {
     }
     
     private func formatTimestamp(_ date: Date) -> String {
+        // Guard against invalid dates
+        let now = Date()
+        let timeInterval = now.timeIntervalSince(date)
+        guard timeInterval.isFinite && !timeInterval.isNaN,
+              date.timeIntervalSince1970.isFinite && !date.timeIntervalSince1970.isNaN else {
+            return "now"
+        }
+        
         let f = RelativeDateTimeFormatter()
         f.unitsStyle = .abbreviated
-        return f.localizedString(for: date, relativeTo: Date())
+        return f.localizedString(for: date, relativeTo: now)
     }
     
 
