@@ -100,10 +100,10 @@ async function collectAllReplies(postId, collected = [], limit = 200) {
 }
 
 // Convert Redis hash to post object with proper types
-function redisHashToPost(hash) {
+async function redisHashToPost(hash) {
   if (!hash || Object.keys(hash).length === 0) return null;
   
-  return {
+  const post = {
     id: hash.id || '',
     userAddress: hash.userAddress || 'unknown',
     signature: hash.signature || '',
@@ -121,6 +121,8 @@ function redisHashToPost(hash) {
     sequentialCode: hash.id || hash.sequentialCode || '',
     code: hash.id || hash.code || ''
   };
+  
+  return post;
 }
 
 router.get('/:id', async (req, res) => {
@@ -129,7 +131,8 @@ router.get('/:id', async (req, res) => {
     const postData = await getPost(id);
     if (!postData) return res.status(404).json({ error: 'Not found' });
     
-    const post = redisHashToPost(postData);
+    const post = await redisHashToPost(postData);
+    if (!post) return res.status(404).json({ error: 'Not found' });
     // Calculate deep replies count
     post.deepRepliesCount = await calculateDeepRepliesCount(id);
     
@@ -177,11 +180,12 @@ router.post('/', async (req, res) => {
     // Store profile data if provided
     if (profileName || profileBio || profileImageBase64) {
       const { storeUserProfile } = require('../services/redis');
-      await storeUserProfile(userAddress, {
-        name: profileName,
-        bio: profileBio,
-        image: profileImageBase64
-      });
+      const profileData = {};
+      if (profileName) profileData.name = profileName;
+      if (profileBio) profileData.bio = profileBio;
+      if (profileImageBase64) profileData.image = profileImageBase64;
+      await storeUserProfile(userAddress, profileData);
+      console.log(`✅ Stored profile data for ${userAddress}: name=${!!profileName}, bio=${!!profileBio}, image=${!!profileImageBase64}`);
     }
     
     // Get the stored post back
@@ -200,8 +204,8 @@ router.get('/:id/replies', async (req, res) => {
   try {
     const root = req.params.id.replace('%23', '#');
     const replies = await getRepliesForPost(root);
-    const formattedReplies = replies.map(redisHashToPost);
-    res.json({ success: true, data: formattedReplies });
+    const formattedReplies = await Promise.all(replies.map(redisHashToPost));
+    res.json({ success: true, data: formattedReplies.filter(p => p !== null) });
   } catch (error) {
     console.error('Error getting replies:', error);
     res.status(500).json({ error: 'Failed to get replies' });
@@ -215,8 +219,8 @@ router.get('/:id/thread', async (req, res) => {
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit || '200', 10)));
     
     const allReplies = await collectAllReplies(root, [], limit);
-    const formattedReplies = allReplies.map(redisHashToPost);
-    res.json({ success: true, data: formattedReplies, totalCount: formattedReplies.length });
+    const formattedReplies = await Promise.all(allReplies.map(redisHashToPost));
+    res.json({ success: true, data: formattedReplies.filter(p => p !== null), totalCount: formattedReplies.length });
   } catch (error) {
     console.error('Error getting thread:', error);
     res.status(500).json({ error: 'Failed to get thread' });
@@ -232,8 +236,8 @@ router.get('/', async (req, res) => {
       const limit = Math.max(1, Math.min(500, parseInt(req.query.limit || '200', 10)));
       
       const allReplies = await collectAllReplies(root, [], limit);
-      const formattedReplies = allReplies.map(redisHashToPost);
-      return res.json({ success: true, data: formattedReplies, totalCount: formattedReplies.length });
+      const formattedReplies = await Promise.all(allReplies.map(redisHashToPost));
+      return res.json({ success: true, data: formattedReplies.filter(p => p !== null), totalCount: formattedReplies.length });
     }
     
     // Check if this is a user posts request
@@ -245,21 +249,22 @@ router.get('/', async (req, res) => {
         const start = page * limit;
         
         const userPosts = await getUserPosts(userAddress, start, limit);
-        const formattedPosts = userPosts.map(redisHashToPost);
+        const formattedPosts = await Promise.all(userPosts.map(redisHashToPost));
+        const validPosts = formattedPosts.filter(p => p !== null);
         
         // Calculate deep replies count for each post
-        for (const post of formattedPosts) {
+        for (const post of validPosts) {
           post.deepRepliesCount = await calculateDeepRepliesCount(post.id);
         }
         
         return res.json({ 
           success: true, 
-          data: formattedPosts, 
+          data: validPosts, 
           pagination: { 
             page, 
             limit, 
-            total: formattedPosts.length,
-            hasMore: formattedPosts.length === limit 
+            total: validPosts.length,
+            hasMore: validPosts.length === limit 
           } 
         });
       }
@@ -271,10 +276,57 @@ router.get('/', async (req, res) => {
     const start = page * limit;
     
     const feedPosts = await getChronologicalFeed(start, limit);
-    const formattedPosts = feedPosts.map(redisHashToPost);
+    const formattedPosts = await Promise.all(feedPosts.map(redisHashToPost));
+    const validPosts = formattedPosts.filter(p => p !== null);
+    
+    // Fetch profile data for all posts in batch
+    const { getUserProfiles } = require('../services/redis');
+    const userAddresses = [...new Set(validPosts.map(p => p.userAddress).filter(addr => addr && addr !== 'unknown'))];
+    console.log(`[PROFILE] Fetching profiles for ${userAddresses.length} addresses:`, userAddresses.slice(0, 3));
+    if (userAddresses.length > 0) {
+      try {
+        const profiles = await getUserProfiles(userAddresses);
+        console.log(`[PROFILE] Got ${Object.keys(profiles).length} profiles. Keys:`, Object.keys(profiles).slice(0, 3));
+        console.log(`[PROFILE] Sample profile data:`, profiles[userAddresses[0]] ? Object.keys(profiles[userAddresses[0]]) : 'No profile for first address');
+        // Enrich posts with profile data
+        let enriched = 0;
+        for (const post of validPosts) {
+          if (post.userAddress && profiles[post.userAddress]) {
+            const profile = profiles[post.userAddress];
+            console.log(`[PROFILE] Post ${post.id} user ${post.userAddress}: profile keys:`, Object.keys(profile));
+            // Check for both 'name' and 'profileName' keys (for backwards compatibility)
+            const profileName = profile.name || profile.profileName;
+            if (profileName && profileName !== 'null' && profileName !== '' && profileName !== 'undefined') {
+              post.profileName = String(profileName);
+              enriched++;
+              console.log(`[PROFILE] Set profileName for ${post.userAddress}: ${profileName.substring(0, 20)}`);
+            } else {
+              console.log(`[PROFILE] No valid profileName for ${post.userAddress}. profileName value:`, profileName);
+            }
+            const profileBio = profile.bio || profile.profileBio;
+            if (profileBio && profileBio !== 'null' && profileBio !== '' && profileBio !== 'undefined') {
+              post.profileBio = String(profileBio);
+            }
+            const profileImage = profile.image || profile.profileImage;
+            if (profileImage && profileImage !== 'null' && profileImage !== '' && profileImage !== 'undefined') {
+              post.profileImage = String(profileImage);
+            }
+          } else {
+            console.log(`[PROFILE] No profile for post ${post.id} user ${post.userAddress}. Has userAddress: ${!!post.userAddress}, Has profile: ${!!profiles[post.userAddress]}`);
+          }
+        }
+        console.log(`[PROFILE] Enriched ${enriched} posts with profile names. Total posts: ${validPosts.length}`);
+        console.log(`[PROFILE] Sample post after enrichment:`, JSON.stringify(validPosts[0]).substring(0, 200));
+      } catch (error) {
+        console.error('[PROFILE] Error enriching posts with profile data:', error);
+        console.error('[PROFILE] Error stack:', error.stack);
+      }
+    } else {
+      console.log(`[PROFILE] No user addresses to fetch profiles for`);
+    }
     
     // Calculate deep replies count for each post
-    for (const post of formattedPosts) {
+    for (const post of validPosts) {
       post.deepRepliesCount = await calculateDeepRepliesCount(post.id);
     }
     
@@ -284,12 +336,12 @@ router.get('/', async (req, res) => {
     
     res.json({ 
       success: true, 
-      data: formattedPosts, 
+      data: validPosts, 
       pagination: { 
         page, 
         limit, 
         total: totalCount,
-        hasMore: formattedPosts.length === limit && (start + limit) < totalCount 
+        hasMore: validPosts.length === limit && (start + limit) < totalCount 
       } 
     });
   } catch (error) {
@@ -331,6 +383,79 @@ router.post('/:id/reward', async (req, res) => {
   } catch (e) {
     console.error('Error rewarding post:', e);
     res.status(500).json({ error: 'Failed to reward post' });
+  }
+});
+
+// DELETE /api/posts/by-timestamp - Delete posts by timestamp (admin only)
+router.delete('/by-timestamp', async (req, res) => {
+  try {
+    const { timestamps } = req.body; // Array of timestamps in milliseconds
+    if (!Array.isArray(timestamps) || timestamps.length === 0) {
+      return res.status(400).json({ error: 'timestamps array required' });
+    }
+
+    const client = getRedisClient();
+    const deletedPosts = [];
+    const errors = [];
+
+    // Get all post IDs from chronological feed
+    const allPostIds = await client.zRange('halo:feed:chronological', 0, -1);
+    
+    for (const postId of allPostIds) {
+      const postData = await getPost(postId);
+      if (!postData) continue;
+
+      const postTimestamp = parseInt(postData.timestamp, 10);
+      if (timestamps.includes(postTimestamp)) {
+        try {
+          // Delete from main post hash
+          await client.del(`halo:post:${postId}`);
+          
+          // Delete from chronological feed
+          await client.zRem('halo:feed:chronological', postId);
+          
+          // Delete from user's posts
+          if (postData.userAddress) {
+            await client.zRem(`halo:user:${postData.userAddress}:posts`, postId);
+          }
+          
+          // Delete from reply indexes
+          if (postData.parentSequentialCode) {
+            await client.zRem(`halo:replies:parent:${postData.parentSequentialCode}`, postId);
+            // Decrement parent's repliesCount
+            const parentKey = `halo:post:${postData.parentSequentialCode}`;
+            const currentCount = await client.hGet(parentKey, 'repliesCount');
+            if (currentCount) {
+              await client.hIncrBy(parentKey, 'repliesCount', -1);
+            }
+          }
+          if (postData.parentIpfsHash) {
+            await client.zRem(`halo:replies:parentipfs:${postData.parentIpfsHash}`, postId);
+            const parentKey = `halo:post:${postData.parentIpfsHash}`;
+            const currentCount = await client.hGet(parentKey, 'repliesCount');
+            if (currentCount) {
+              await client.hIncrBy(parentKey, 'repliesCount', -1);
+            }
+          }
+
+          deletedPosts.push({ postId, timestamp: postTimestamp });
+          console.log(`Deleted post: ${postId} (timestamp: ${postTimestamp})`);
+        } catch (error) {
+          errors.push({ postId, error: error.message });
+          console.error(`Error deleting post ${postId}:`, error);
+        }
+      }
+    }
+
+    res.json({
+      success: true,
+      deleted: deletedPosts.length,
+      deletedPosts,
+      errors: errors.length > 0 ? errors : undefined
+    });
+  } catch (error) {
+    console.error('Error deleting posts by timestamp:', error);
+    res.status(500).json({ error: 'Failed to delete posts', message: error.message });
   }
 });
 
