@@ -77,6 +77,8 @@ struct AnalyticsData {
 extension Notification.Name {
     static let zeroaNavigateToProfile = Notification.Name("ZeroaNavigateToProfile")
     static let zeroaAccountActivationChanged = Notification.Name("ZeroaAccountActivationChanged")
+    static let zeroaDisplayNameDidChange = Notification.Name("ZeroaDisplayNameDidChange")
+    static let zeroaOpenSeedSecurity = Notification.Name("ZeroaOpenSeedSecurity")
 }
 
 // MARK: - Main Content View
@@ -139,6 +141,9 @@ struct ContentView: View {
                         SecondaryButton(title: "Create New Account") {
                             path.append("create")
                         }
+
+                        IdPContactSignInSection(path: $path)
+                            .environmentObject(authManager)
                     }
                     .padding(.horizontal, DesignSystem.Spacing.lg)
                     
@@ -309,6 +314,7 @@ struct ContentView: View {
 // MARK: - Create Account View
 struct CreateAccountView: View {
     @Binding var path: NavigationPath
+    @EnvironmentObject var authManager: AuthManager
     @State private var mnemonic = ""
     @State private var hasWrittenDown = false
     @State private var showMnemonic = false  // Hide mnemonic by default
@@ -335,6 +341,14 @@ struct CreateAccountView: View {
                         .multilineTextAlignment(.center)
                 }
                 .padding(.top, DesignSystem.Spacing.xxl)
+
+                IdPContactSignInSection(path: $path)
+                    .environmentObject(authManager)
+                    .padding(.top, DesignSystem.Spacing.sm)
+
+                Text("Or create with a recovery phrase now")
+                    .font(DesignSystem.Typography.caption)
+                    .foregroundColor(DesignSystem.Colors.textSecondary)
                 
                 Spacer()
                 
@@ -416,8 +430,14 @@ struct CreateAccountView: View {
             isCreating = false
             if success {
                     print("✅ Account created successfully with address: \(derivedAddress ?? "unknown")")
-                    // Navigate to home screen
+                    BackupStatusStore.markCeremonyComplete()
+                    AppGroupsService.shared.setProfileActive(true)
+                    if let addr = derivedAddress {
+                        AppGroupsService.shared.storeTLSAddress(addr)
+                    }
+                    authManager.isAuthenticated = true
                     path.append("home")
+                    Task { await HaloService.shared.ensureToken() }
                 } else {
                     print("❌ Failed to create account")
                     // Could add error handling here if needed
@@ -1892,6 +1912,24 @@ struct DashboardView: View {
                 .ignoresSafeArea()
             
             VStack(spacing: 0) {
+                if BackupStatusStore.isIncomplete {
+                    Button {
+                        path.append("seedSecurity")
+                    } label: {
+                        HStack(spacing: DesignSystem.Spacing.sm) {
+                            Image(systemName: "exclamationmark.shield.fill")
+                            Text("Backup incomplete — tap to secure your recovery phrase")
+                                .font(DesignSystem.Typography.bodySmall)
+                                .multilineTextAlignment(.leading)
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                        }
+                        .foregroundColor(DesignSystem.Colors.onPrimary)
+                        .padding(DesignSystem.Spacing.md)
+                        .background(DesignSystem.Colors.warning)
+                    }
+                }
+
                 // Debug buttons removed per request
                 
                 if selectedTab == 0 {
@@ -2164,12 +2202,23 @@ struct DashboardView: View {
             initialize()
             setupCompanionTaskListener()
             updateFilteredCoins()
+            openSeedSecurityIfPending()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .zeroaOpenSeedSecurity)) { _ in
+            path.append("seedSecurity")
         }
         .onReceive(tlsService.$currentBalance) { balance in
             tlsBalance = balance
             coinBalance = balance
         }
         .navigationBarHidden(true)
+    }
+
+    private func openSeedSecurityIfPending() {
+        guard AppGroupsService.shared.consumePendingOpenSeedSecurity() else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            path.append("seedSecurity")
+        }
     }
     
     private func handleCommand(userInput: String = "") {
@@ -2559,30 +2608,35 @@ struct DashboardView: View {
     }
     
     private func parseTelestaiPrice(from data: Data, source: Int) async -> (price: Double, change: Double)? {
+        func number(_ value: Any?) -> Double? {
+            if let d = value as? Double { return d }
+            if let n = value as? NSNumber { return n.doubleValue }
+            if let s = value as? String { return Double(s) }
+            return nil
+        }
+        
         do {
             switch source {
-            case 0: // CoinGecko
+            case 0: // CoinGecko — usd_24h_change is often null for TLS
                 if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let telestai = json["telestai"] as? [String: Any],
-                   let usd = telestai["usd"] as? Double,
-                   let usdChange = telestai["usd_24h_change"] as? Double {
+                   let usd = number(telestai["usd"]) {
+                    let usdChange = number(telestai["usd_24h_change"]) ?? 0.0
                     return (usd, usdChange)
                 }
             case 1: // Coinpaprika
                 if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let quotes = json["quotes"] as? [String: Any],
                    let usd = quotes["USD"] as? [String: Any],
-                   let price = usd["price"] as? Double,
-                   let change = usd["change_24h"] as? Double {
+                   let price = number(usd["price"]) {
+                    let change = number(usd["change_24h"]) ?? 0.0
                     return (price, change)
                 }
             case 2: // CoinCap
                 if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let data = json["data"] as? [String: Any],
-                   let priceUsd = data["priceUsd"] as? String,
-                   let changePercent24Hr = data["changePercent24Hr"] as? String,
-                   let price = Double(priceUsd),
-                   let change = Double(changePercent24Hr) {
+                   let price = number(data["priceUsd"]) {
+                    let change = number(data["changePercent24Hr"]) ?? 0.0
                     return (price, change)
                 }
             default:
@@ -3130,6 +3184,7 @@ struct CoinRowView: View {
 
 struct BottomNavigationView: View {
     @Binding var selectedTab: Int
+    @ObservedObject private var themeManager = ThemeManager.shared
     
     var body: some View {
         HStack(spacing: 0) {
@@ -3178,15 +3233,19 @@ struct BottomNavigationView: View {
             }
         }
         .padding(.vertical, DesignSystem.Spacing.md)
-        .padding(.bottom, DesignSystem.Spacing.xs) // 2mm from bottom of screen
-        .background(DesignSystem.Colors.background)
+        .padding(.bottom, DesignSystem.Spacing.xs)
+        .background(
+            DesignSystem.Colors.background
+                .ignoresSafeArea(edges: .bottom)
+        )
         .overlay(
             Rectangle()
                 .frame(height: 1)
                 .foregroundColor(DesignSystem.Colors.secondary.opacity(0.3)),
             alignment: .top
         )
-        .ignoresSafeArea(.container, edges: .bottom)
+        // Force a full rebuild when theme flips so the bar never keeps the old fill.
+        .id(themeManager.currentTheme)
     }
 }
 
@@ -3384,6 +3443,14 @@ struct HomeView: View {
         AppGroupsService.shared.sharedDefaults ?? UserDefaults.standard
     }
     private let walletService = WalletService.shared
+
+    private func scopedProfileKey(_ base: String) -> String {
+        guard let tls = walletService.loadAddress()?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !tls.isEmpty else {
+            return base
+        }
+        return "\(base)_\(tls)"
+    }
     
     var body: some View {
         ZStack {
@@ -3674,6 +3741,11 @@ struct HomeView: View {
         .onAppear {
             loadSettings()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .zeroaDisplayNameDidChange)) { note in
+            if let name = note.object as? String, !name.isEmpty {
+                displayName = name
+            }
+        }
         .onChange(of: profileImage) { newValue in
             saveProfileImage(newValue)
         }
@@ -3714,29 +3786,39 @@ struct HomeView: View {
     }
     
     private func loadProfileData() {
-        if let savedName = profileDefaults.string(forKey: profileDisplayNameKey), !savedName.isEmpty {
+        let scopedImageKey = scopedProfileKey(profileImageKey)
+
+        let tls = walletService.loadAddress()
+        let savedName = AppGroupsService.shared.profileDisplayName(tls: tls)
+        if !savedName.isEmpty {
             displayName = savedName
         }
-        if let imageData = profileDefaults.data(forKey: profileImageKey),
+
+        if let imageData = profileDefaults.data(forKey: scopedImageKey),
            let image = UIImage(data: imageData) {
             profileImage = image
+        } else if let imageData = profileDefaults.data(forKey: profileImageKey),
+                  let image = UIImage(data: imageData) {
+            profileImage = image
         }
+
         if profileDefaults.object(forKey: profileAccountActiveKey) != nil {
             isAccountActive = profileDefaults.bool(forKey: profileAccountActiveKey)
         }
     }
     
     private func saveDisplayName(_ name: String) {
-        profileDefaults.set(name, forKey: profileDisplayNameKey)
-        profileDefaults.synchronize()
+        AppGroupsService.shared.setProfileDisplayName(name, tls: walletService.loadAddress())
     }
     
     private func saveProfileImage(_ image: UIImage?) {
         if let image = image,
            let data = image.jpegData(compressionQuality: 0.85) {
             profileDefaults.set(data, forKey: profileImageKey)
+            profileDefaults.set(data, forKey: scopedProfileKey(profileImageKey))
         } else {
             profileDefaults.removeObject(forKey: profileImageKey)
+            profileDefaults.removeObject(forKey: scopedProfileKey(profileImageKey))
         }
         profileDefaults.synchronize()
     }
@@ -3883,15 +3965,40 @@ struct ReceiveView: View {
 
 struct StatsView: View {
     @Binding var path: NavigationPath
+    @ObservedObject private var themeManager = ThemeManager.shared
+    @StateObject private var tlsService = TLSBlockchainService.shared
+    @State private var isLoading = true
+    @State private var networkLabel = TLSNetwork.current.displayName
+    @State private var chain = "—"
+    @State private var algo = "—"
+    @State private var subversion = "—"
+    @State private var blocks = 0
+    @State private var difficulty = 0.0
+    @State private var networkHashrate = 0.0
+    @State private var connected = false
+    @State private var errorText: String?
     
     var body: some View {
         ZStack {
             DesignSystem.Colors.background
                 .ignoresSafeArea()
+                .id(themeManager.currentTheme)
             
             VStack(spacing: DesignSystem.Spacing.lg) {
-                // Header
                 HStack {
+                    Button(action: {
+                        if !path.isEmpty { path.removeLast() }
+                    }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "chevron.left")
+                                .font(.system(size: 16, weight: .semibold))
+                            Text("Back")
+                                .font(DesignSystem.Typography.bodyMedium)
+                                .fontWeight(.semibold)
+                        }
+                        .foregroundColor(DesignSystem.Colors.primary)
+                    }
+                    
                     Spacer()
                     
                     Text("Network Stats")
@@ -3899,29 +4006,113 @@ struct StatsView: View {
                         .foregroundColor(DesignSystem.Colors.text)
                     
                     Spacer()
+                    
+                    // Symmetry placeholder
+                    Color.clear.frame(width: 60, height: 1)
                 }
                 .padding(.horizontal, DesignSystem.Spacing.lg)
                 .padding(.top, DesignSystem.Spacing.lg)
                 
-                Spacer()
-                
-                VStack(spacing: DesignSystem.Spacing.lg) {
-                    Image(systemName: "chart.bar.fill")
-                        .font(.system(size: 60))
-                        .foregroundColor(DesignSystem.Colors.secondary)
-                    
-                    Text("Coming Soon")
-                        .font(DesignSystem.Typography.titleLarge)
-                        .foregroundColor(DesignSystem.Colors.text)
-                    
-                    Text("Network statistics and analytics will be available in a future update.")
+                if isLoading {
+                    Spacer()
+                    ProgressView()
+                        .tint(DesignSystem.Colors.primary)
+                    Text("Loading network stats…")
+                        .font(DesignSystem.Typography.bodyMedium)
+                        .foregroundColor(DesignSystem.Colors.textSecondary)
+                    Spacer()
+                } else {
+                    ScrollView {
+                        VStack(spacing: DesignSystem.Spacing.md) {
+                            if let errorText {
+                                Text(errorText)
+                                    .font(DesignSystem.Typography.bodySmall)
+                                    .foregroundColor(DesignSystem.Colors.warning)
+                                    .multilineTextAlignment(.center)
+                                    .padding(.horizontal)
+                            }
+                            
+                            statCard(title: "Connection", value: connected ? "Online" : "Offline",
+                                     icon: connected ? "wifi" : "wifi.slash",
+                                     accent: connected ? DesignSystem.Colors.success : DesignSystem.Colors.error)
+                            statCard(title: "Network", value: networkLabel, icon: "globe")
+                            statCard(title: "Chain", value: chain, icon: "link")
+                            statCard(title: "PoW", value: algo, icon: "bolt.fill")
+                            statCard(title: "Node", value: subversion, icon: "server.rack")
+                            statCard(title: "Block height", value: blocks.formatted(), icon: "square.stack.3d.up")
+                            statCard(title: "Difficulty", value: String(format: "%.4f", difficulty), icon: "gauge.with.dots.needle.67percent")
+                            statCard(title: "Network hashrate", value: formatHashrate(networkHashrate), icon: "cpu")
+                            
+                            Button("Refresh") {
+                                Task { await loadStats() }
+                            }
                             .font(DesignSystem.Typography.bodyMedium)
-                            .foregroundColor(DesignSystem.Colors.textSecondary)
-                            .multilineTextAlignment(.center)
+                            .fontWeight(.semibold)
+                            .foregroundColor(DesignSystem.Colors.secondary)
+                            .padding(.top, DesignSystem.Spacing.sm)
+                        }
                         .padding(.horizontal, DesignSystem.Spacing.lg)
+                        .padding(.bottom, DesignSystem.Spacing.xl)
+                    }
                 }
-                
+            }
+        }
+        .navigationBarHidden(true)
+        .task { await loadStats() }
+    }
+    
+    private func statCard(title: String, value: String, icon: String, accent: Color = DesignSystem.Colors.secondary) -> some View {
+        CardView {
+            HStack(spacing: DesignSystem.Spacing.md) {
+                Image(systemName: icon)
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundColor(accent)
+                    .frame(width: 28)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title)
+                        .font(DesignSystem.Typography.caption)
+                        .foregroundColor(DesignSystem.Colors.textSecondary)
+                    Text(value)
+                        .font(DesignSystem.Typography.headline)
+                        .foregroundColor(DesignSystem.Colors.text)
+                }
                 Spacer()
+            }
+        }
+    }
+    
+    private func formatHashrate(_ hps: Double) -> String {
+        if hps >= 1_000_000_000 { return String(format: "%.2f GH/s", hps / 1_000_000_000) }
+        if hps >= 1_000_000 { return String(format: "%.2f MH/s", hps / 1_000_000) }
+        if hps >= 1_000 { return String(format: "%.2f kH/s", hps / 1_000) }
+        return String(format: "%.0f H/s", hps)
+    }
+    
+    private func loadStats() async {
+        await MainActor.run { isLoading = true; errorText = nil }
+        connected = await tlsService.checkConnection()
+        
+        do {
+            let status = try await tlsService.fetchNetworkStatus()
+            await MainActor.run {
+                networkLabel = TLSNetwork.current.displayName
+                chain = status.chain
+                algo = status.algo ?? TLSNetwork.current.expectedAlgo
+                subversion = status.subversion ?? "—"
+                blocks = status.blocks
+                difficulty = status.difficulty
+                networkHashrate = status.networkhashps ?? 0
+                connected = true
+                isLoading = false
+            }
+        } catch {
+            await MainActor.run {
+                networkLabel = TLSNetwork.current.displayName
+                errorText = "Could not refresh live stats: \(error.localizedDescription)"
+                if tlsService.lastBlockHeight > 0 {
+                    blocks = tlsService.lastBlockHeight
+                }
+                isLoading = false
             }
         }
     }
@@ -3929,15 +4120,29 @@ struct StatsView: View {
 
 struct AIFeaturesView: View {
     @Binding var path: NavigationPath
+    @ObservedObject private var themeManager = ThemeManager.shared
     
     var body: some View {
         ZStack {
             DesignSystem.Colors.background
                 .ignoresSafeArea()
+                .id(themeManager.currentTheme)
             
             VStack(spacing: DesignSystem.Spacing.lg) {
-                // Header
                 HStack {
+                    Button(action: {
+                        if !path.isEmpty { path.removeLast() }
+                    }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "chevron.left")
+                                .font(.system(size: 16, weight: .semibold))
+                            Text("Back")
+                                .font(DesignSystem.Typography.bodyMedium)
+                                .fontWeight(.semibold)
+                        }
+                        .foregroundColor(DesignSystem.Colors.primary)
+                    }
+                    
                     Spacer()
                     
                     Text("AI Features")
@@ -3945,6 +4150,8 @@ struct AIFeaturesView: View {
                         .foregroundColor(DesignSystem.Colors.text)
                     
                     Spacer()
+                    
+                    Color.clear.frame(width: 60, height: 1)
                 }
                 .padding(.horizontal, DesignSystem.Spacing.lg)
                 .padding(.top, DesignSystem.Spacing.lg)
@@ -3970,6 +4177,7 @@ struct AIFeaturesView: View {
                 Spacer()
             }
         }
+        .navigationBarHidden(true)
     }
 }
 
@@ -4164,6 +4372,7 @@ struct SettingsView: View {
     @State private var showLanguagePicker = false
     @State private var showCurrencyPicker = false
     @State private var showThemePicker = false
+    @State private var useTestnet = UserDefaults.standard.bool(forKey: TLSNetwork.useTestnetDefaultsKey)
     @StateObject private var localizationManager = LocalizationManager.shared
     @StateObject private var themeManager = ThemeManager.shared
     
@@ -4171,6 +4380,7 @@ struct SettingsView: View {
         ZStack {
             DesignSystem.Colors.background
                 .ignoresSafeArea()
+                .id(themeManager.currentTheme)
             
             VStack(spacing: DesignSystem.Spacing.lg) {
                 // Header with Back Button
@@ -4204,6 +4414,74 @@ struct SettingsView: View {
                 
                 ScrollView {
                     VStack(spacing: DesignSystem.Spacing.lg) {
+                        // Contact binding (IdP) + backup status
+                        CardView {
+                            VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
+                                Text("Identity & Contact")
+                                    .font(DesignSystem.Typography.headline)
+                                    .foregroundColor(DesignSystem.Colors.text)
+
+                                if BackupStatusStore.isIncomplete {
+                                    Text("Backup incomplete — write down your recovery phrase before you lose this device.")
+                                        .font(DesignSystem.Typography.bodySmall)
+                                        .foregroundColor(DesignSystem.Colors.warning)
+                                    Button("Open recovery phrase") {
+                                        path.append("seedSecurity")
+                                    }
+                                    .font(DesignSystem.Typography.bodyMedium)
+                                    .foregroundColor(DesignSystem.Colors.secondary)
+                                }
+
+                                if let binding = ContactBindingStore.shared.currentBinding() {
+                                    HStack {
+                                        Text("Linked: \(binding.displayLabel)")
+                                            .font(DesignSystem.Typography.bodyMedium)
+                                            .foregroundColor(DesignSystem.Colors.text)
+                                        Spacer()
+                                        Button("Unbind") {
+                                            ContactBindingStore.shared.unbind()
+                                        }
+                                        .foregroundColor(DesignSystem.Colors.error)
+                                    }
+                                    Text("Contact labels do not own your keys. Unbind anytime.")
+                                        .font(DesignSystem.Typography.caption)
+                                        .foregroundColor(DesignSystem.Colors.textSecondary)
+                                } else {
+                                    Text("No Apple/Google contact linked. Optional — wallet works without it.")
+                                        .font(DesignSystem.Typography.caption)
+                                        .foregroundColor(DesignSystem.Colors.textSecondary)
+                                }
+                            }
+                        }
+                        .padding(.horizontal, DesignSystem.Spacing.lg)
+
+                        CardView {
+                            VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
+                                Text("Telestai Network")
+                                    .font(DesignSystem.Typography.headline)
+                                    .foregroundColor(DesignSystem.Colors.text)
+
+                                Toggle(isOn: $useTestnet) {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Use TestNet 3.0.1")
+                                            .font(DesignSystem.Typography.bodyMedium)
+                                            .foregroundColor(DesignSystem.Colors.text)
+                                        Text(useTestnet
+                                             ? "Explorer uses Optimus Meraki soak (3.0.1). Sends need tls.testnetRpcBaseURL — not mainnet Halo."
+                                             : "Mainnet (Cryptoscope + Halo). Default for App Store builds.")
+                                            .font(DesignSystem.Typography.caption)
+                                            .foregroundColor(DesignSystem.Colors.textSecondary)
+                                    }
+                                }
+                                .tint(DesignSystem.Colors.secondary)
+                                .onChange(of: useTestnet) { _, enabled in
+                                    UserDefaults.standard.set(enabled, forKey: TLSNetwork.useTestnetDefaultsKey)
+                                    TLSRPCClient.shared.setBaseURLOverride(nil)
+                                }
+                            }
+                        }
+                        .padding(.horizontal, DesignSystem.Spacing.lg)
+
                         // AI Status
                         CardView {
                             VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
@@ -4395,7 +4673,9 @@ struct SettingsView: View {
                 selection: $selectedTheme,
                 options: availableThemes,
                 onSelectionChanged: { theme in
+                    selectedTheme = theme
                     themeManager.currentTheme = theme
+                    UserDefaults.standard.set(theme, forKey: "user_theme")
                 }
             )
         }
@@ -4662,6 +4942,7 @@ struct SeedPhraseSecurityView: View {
                     
                     if let phrase = walletService.loadMnemonic(), !phrase.isEmpty {
                         seedPhrase = phrase
+                        BackupStatusStore.markCeremonyComplete()
                     } else {
                         authenticationError = "No seed phrase is stored on this device."
                     }
@@ -5317,12 +5598,14 @@ struct PreferencePickerView: View {
     let options: [String]
     let onSelectionChanged: ((String) -> Void)?
     @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var themeManager = ThemeManager.shared
     
     var body: some View {
         NavigationView {
             ZStack {
                 DesignSystem.Colors.background
                     .ignoresSafeArea()
+                    .id(themeManager.currentTheme)
                 
                 VStack(spacing: DesignSystem.Spacing.lg) {
                     HStack {

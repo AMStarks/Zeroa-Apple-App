@@ -36,11 +36,11 @@ struct SubscriptionSheetView: View {
                             .font(.system(size: 56))
                             .foregroundColor(Color(red: 1.0, green: 0.6, blue: 0.0))
 
-                        Text("Unlock AI Features")
+                        Text("Unlock LASKO Features")
                             .font(.system(size: 20, weight: .semibold))
                             .foregroundColor(.white)
 
-                        Text("Subscribe to enable enhanced AI services across the Telestai ecosystem.")
+                        Text("Subscribe to enable enhanced services across the LASKO platform.")
                             .font(.system(size: 15))
                             .foregroundColor(.white.opacity(0.8))
                             .multilineTextAlignment(.center)
@@ -62,9 +62,9 @@ struct SubscriptionSheetView: View {
                         }
 
                         VStack(alignment: .leading, spacing: 8) {
-                            Label("Priority AI access", systemImage: "bolt.fill")
+                            Label("Full Platform Access", systemImage: "bolt.fill")
                                 .foregroundColor(.white)
-                            Label("FluxDrive sync perks", systemImage: "externaldrive.fill")
+                            Label("Storage sync perks", systemImage: "externaldrive.fill")
                                 .foregroundColor(.white)
                             Label("Support the network", systemImage: "hands.sparkles.fill")
                                 .foregroundColor(.white)
@@ -140,10 +140,17 @@ struct SubscriptionSheetView: View {
         isProcessing = true
         errorMessage = nil
 
-        // Placeholder for subscription call. In the old flow, payment was 10 TLS to a known address.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-            isProcessing = false
-            dismiss()
+        Task {
+            let success = await LASKOService.shared.requestSubscriptionPayment()
+            
+            await MainActor.run {
+                isProcessing = false
+                if success {
+                    dismiss()
+                } else {
+                    errorMessage = "Payment failed. Please try again."
+                }
+            }
         }
     }
 }

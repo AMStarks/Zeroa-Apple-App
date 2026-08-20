@@ -96,37 +96,53 @@ struct TransactionHistoryView: View {
                     }
                 }
                 
-                // Filter and Search
-                HStack(spacing: DesignSystem.Spacing.md) {
-                    // Filter Picker
-                    Picker("Filter", selection: $selectedFilter) {
+                // Filter chips (SegmentedPicker with icons rendered as literal "...")
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: DesignSystem.Spacing.sm) {
                         ForEach(TransactionFilter.allCases, id: \.self) { filter in
-                            HStack {
-                                Image(systemName: filter.icon)
-                                Text(filter.rawValue)
+                            Button {
+                                selectedFilter = filter
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: filter.icon)
+                                        .font(.system(size: 12, weight: .semibold))
+                                    Text(filter.rawValue)
+                                        .font(DesignSystem.Typography.bodySmall)
+                                        .fontWeight(.semibold)
+                                }
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .foregroundColor(selectedFilter == filter ? .white : DesignSystem.Colors.text)
+                                .background(
+                                    Capsule()
+                                        .fill(selectedFilter == filter ? DesignSystem.Colors.primary : DesignSystem.Colors.surface)
+                                )
+                                .overlay(
+                                    Capsule()
+                                        .stroke(DesignSystem.Colors.border.opacity(selectedFilter == filter ? 0 : 1), lineWidth: 1)
+                                )
                             }
-                            .tag(filter)
+                            .buttonStyle(PlainButtonStyle())
                         }
                     }
-                    .pickerStyle(SegmentedPickerStyle())
-                    
-                    // Search
-                    HStack {
-                        Image(systemName: "magnifyingglass")
-                            .foregroundColor(DesignSystem.Colors.textSecondary)
-                        
-                        TextField("Search transactions", text: $searchText)
-                            .textFieldStyle(PlainTextFieldStyle())
-                    }
-                    .padding(.horizontal, DesignSystem.Spacing.md)
-                    .padding(.vertical, DesignSystem.Spacing.sm)
-                    .background(DesignSystem.Colors.surface)
-                    .cornerRadius(DesignSystem.CornerRadius.medium)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.medium)
-                            .stroke(DesignSystem.Colors.border, lineWidth: 1)
-                    )
                 }
+                
+                // Search
+                HStack {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundColor(DesignSystem.Colors.textSecondary)
+                    
+                    TextField("Search transactions", text: $searchText)
+                        .textFieldStyle(PlainTextFieldStyle())
+                }
+                .padding(.horizontal, DesignSystem.Spacing.md)
+                .padding(.vertical, DesignSystem.Spacing.sm)
+                .background(DesignSystem.Colors.surface)
+                .cornerRadius(DesignSystem.CornerRadius.medium)
+                .overlay(
+                    RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.medium)
+                        .stroke(DesignSystem.Colors.border, lineWidth: 1)
+                )
                 
                 if shouldShowTelestaiExtras {
                     Button(action: {

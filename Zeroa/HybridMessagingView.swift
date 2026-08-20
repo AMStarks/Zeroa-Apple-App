@@ -135,111 +135,10 @@ struct HybridMessagingView: View {
             showAlert = true
             return
         }
-        
-        guard !messageText.isEmpty else { return }
-        
-        Task {
-            // Try P2P first, fallback to server
-            // let p2pSuccess = await sendP2PMessage(to: contact.id, content: messageText)  // Temporarily disabled
-            let p2pSuccess = false  // Temporarily disabled P2P
-            
-            if !p2pSuccess {
-                // Fallback to server relay
-                let serverSuccess = await p2pService.sendP2PMessage(
-                    to: contact.id,
-                    content: messageText
-                )
-                
-                await MainActor.run {
-                    if serverSuccess {
-                        messageText = ""
-                        alertMessage = "Message sent via server relay"
-                    } else {
-                        alertMessage = "Failed to send message"
-                    }
-                    showAlert = true
-                }
-            } else {
-                await MainActor.run {
-                    messageText = ""
-                    alertMessage = "Message sent via P2P!"
-                }
-            }
-        }
-    }
-    
-    // Temporarily disabled for simulator testing
-    /*
-    private func sendP2PMessage(to contactID: String, content: String) async -> Bool {
-        // Check if we have an active P2P connection
-        if webRTCManager.activeConnections[contactID] != nil {
-            webRTCManager.sendData(to: contactID, data: content.data(using: .utf8) ?? Data(), channel: "messaging")
-            return true
-        }
-        
-        // Try to establish P2P connection
-        do {
-            let offerSDP = try await createOfferSDP(for: contactID)
-            // For now, just send via regular service since P2P offer/answer not fully implemented
-            p2pService.sendMessage(to: contactID, content: content)
-            return true
-        } catch {
-            print("❌ P2P connection failed: \(error)")
-        }
-        
-        return false
-    }
-    
-    private func createOfferSDP(for contactID: String) async throws -> String {
-        guard let peerConnection = webRTCManager.createPeerConnection(for: contactID) else {
-            throw NSError(domain: "WebRTC", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to create peer connection"])
-        }
-        
-        return try await withCheckedThrowingContinuation { continuation in
-            let constraints = RTCMediaConstraints(
-                mandatoryConstraints: [
-                    "OfferToReceiveAudio": "true",
-                    "OfferToReceiveVideo": "true"
-                ],
-                optionalConstraints: [
-                    "DtlsSrtpKeyAgreement": "true"
-                ]
-            )
-            
-            peerConnection.offer(for: constraints) { description, error in
-                if let error = error {
-                    continuation.resume(throwing: error)
-                } else if let description = description {
-                    continuation.resume(returning: description.sdp)
-                } else {
-                    continuation.resume(throwing: NSError(domain: "WebRTC", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to create offer"]))
-                }
-            }
-        }
-    }
-    */
-    
-    private func handleP2PMessage(_ message: String) {
-        // Parse message and add to conversation
-        // This would typically parse a JSON message with sender info
-        let p2pMessage = P2PMessage(
-            id: UUID().uuidString,
-            senderId: "p2p_sender",
-            receiverId: "current_user",
-            content: message,
-            timestamp: Date(),
-            messageType: .text,
-            isRead: false
-        )
-        
-        // Add to current conversation if available
-        if let conversation = selectedConversation {
-            // Update conversation with new message
-            // This would typically update the conversation in the service
-        }
-        
-        alertMessage = "P2P message received: \(message)"
-        showAlert = true
+        guard !messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let text = messageText
+        messageText = ""
+        p2pService.sendP2PMessage(to: contact.address, content: text)
     }
     
     private func addContact() {
@@ -248,28 +147,18 @@ struct HybridMessagingView: View {
             showAlert = true
             return
         }
-        
-        Task {
-            p2pService.addContact(
-                name: newContactName,
-                address: newContactAddress,
-                publicKey: "mock_public_key"
-            )
-            let success = true
-            
-            await MainActor.run {
-                if success {
-                    newContactAddress = ""
-                    newContactName = ""
-                    showAddContact = false
-                    alertMessage = "Contact added successfully!"
-                } else {
-                    alertMessage = "Failed to add contact. Please verify the address."
-                }
-                showAlert = true
-            }
-        }
+        p2pService.addContact(
+            name: newContactName,
+            address: newContactAddress,
+            publicKey: nil
+        )
+        newContactAddress = ""
+        newContactName = ""
+        showAddContact = false
+        alertMessage = "Contact added — pubkey will sync when they are online on Halo"
+        showAlert = true
     }
+}
 
 // MARK: - Conversations Tab View
 struct ConversationsTabView: View {
@@ -354,8 +243,15 @@ struct ConversationsTabView: View {
                                         // Show conversation detail
                                         selectedConversation = conversation
                                         let contacts = TLSLayer2MessagingService.shared.contacts
-                                        if let contact = contacts.first(where: { $0.address == conversation.participantAddress }) {
+                                        if let contact = contacts.first(where: { $0.address == conversation.participantAddress || $0.address == conversation.contactId }) {
                                             selectedContact = contact
+                                        } else {
+                                            selectedContact = P2PContact(
+                                                id: conversation.contactId,
+                                                name: conversation.contactName,
+                                                address: conversation.contactId,
+                                                publicKey: ""
+                                            )
                                         }
                                         showConversationDetail = true
                                     }
@@ -506,7 +402,7 @@ struct SwitchboardConversationDetailView: View {
                             ForEach(messages) { message in
                                 MessageBubbleView(
                                     message: message,
-                                    isFromCurrentUser: message.senderId == "self"
+                                    isFromCurrentUser: message.senderId == (WalletService.shared.loadAddress() ?? "")
                                 )
                             }
                             
@@ -544,35 +440,22 @@ struct SwitchboardConversationDetailView: View {
         .onAppear {
             loadMessages()
         }
+        .onReceive(p2pService.$messages) { _ in
+            loadMessages()
+        }
     }
     
     private func loadMessages() {
-        messages = p2pService.getMessages(for: contact.id)
+        messages = p2pService.getMessages(for: contact.address)
+        p2pService.markAsRead(contactAddress: contact.address)
     }
     
     private func sendMessage() {
         guard !messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        
-        let message = P2PMessage(
-            senderId: "self",
-            receiverId: contact.id,
-            content: messageText,
-            timestamp: Date()
-        )
-        
-        messages.append(message)
+        let text = messageText
         messageText = ""
-        
-        // Simulate typing indicator
-        isTyping = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-            isTyping = false
-        }
-        
-        // Send message via P2P service
-        Task {
-            await p2pService.sendP2PMessage(to: contact.id, content: message.content)
-        }
+        p2pService.sendP2PMessage(to: contact.address, content: text)
+        loadMessages()
     }
 }
 
@@ -646,62 +529,33 @@ struct SwitchboardEnhancedMessageInputView: View {
     @Binding var isTyping: Bool
     @Binding var showMediaOptions: Bool
     let onSend: () -> Void
-    
-    @Environment(\.colorScheme) private var colorScheme
     @FocusState private var isTextFieldFocused: Bool
     
     var body: some View {
-        VStack(spacing: 0) {
-            // Media options (when expanded)
-            if showMediaOptions {
-                SwitchboardMediaOptionsView()
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
+        HStack(spacing: DesignSystem.Spacing.sm) {
+            TextField("Message", text: $messageText, axis: .vertical)
+                .textFieldStyle(.plain)
+                .padding(.horizontal, DesignSystem.Spacing.md)
+                .padding(.vertical, DesignSystem.Spacing.sm)
+                .background(DesignSystem.Colors.surface)
+                .clipShape(RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.medium))
+                .focused($isTextFieldFocused)
+                .lineLimit(1...4)
             
-            // Message input bar
-            HStack(spacing: DesignSystem.Spacing.sm) {
-                // Media button
-                Button(action: {
-                    withAnimation(.easeInOut(duration: 0.3)) {
-                        showMediaOptions.toggle()
-                    }
-                }) {
-                    Image(systemName: showMediaOptions ? "chevron.up" : "plus")
-                        .font(.system(size: 18, weight: .medium))
-                        .foregroundColor(DesignSystem.Colors.secondary)
-                        .frame(width: 32, height: 32)
-                        .background(DesignSystem.Colors.surface)
-                        .clipShape(Circle())
-                }
-                
-                // Text input
-                HStack(spacing: DesignSystem.Spacing.xs) {
-                    TextField("Message", text: $messageText, axis: .vertical)
-                        .textFieldStyle(PlainTextFieldStyle())
-                        .font(DesignSystem.Typography.bodyMedium)
-                        .foregroundColor(DesignSystem.Colors.text)
-                        .focused($isTextFieldFocused)
-                        .lineLimit(1...4)
-                        .padding(.horizontal, DesignSystem.Spacing.md)
-                        .padding(.vertical, DesignSystem.Spacing.sm)
-                        .background(DesignSystem.Colors.surface)
-                        .clipShape(RoundedRectangle(cornerRadius: 20))
-                    
-                    // Send button
-                    Button(action: {
-                        onSend()
-                    }) {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.system(size: 24, weight: .medium))
-                            .foregroundColor(messageText.isEmpty ? DesignSystem.Colors.textSecondary : DesignSystem.Colors.secondary)
-                    }
-                    .disabled(messageText.isEmpty)
-                }
+            Button(action: onSend) {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.system(size: 32))
+                    .foregroundColor(
+                        messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        ? DesignSystem.Colors.textSecondary
+                        : DesignSystem.Colors.secondary
+                    )
             }
-            .padding(.horizontal, DesignSystem.Spacing.lg)
-            .padding(.vertical, DesignSystem.Spacing.md)
-            .background(DesignSystem.Colors.background)
+            .disabled(messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
+        .padding(.horizontal, DesignSystem.Spacing.lg)
+        .padding(.vertical, DesignSystem.Spacing.md)
+        .background(DesignSystem.Colors.background)
     }
 }
 
@@ -1305,17 +1159,19 @@ struct P2PSettingsView: View {
                                 Spacer()
                             }
                             
-                            VStack(spacing: DesignSystem.Spacing.md) {
+                            VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
                                 // Name Field
                                 VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
                                     Text("Display Name")
                                         .font(DesignSystem.Typography.bodySmall)
                                         .foregroundColor(DesignSystem.Colors.textSecondary)
                                     
-                                    TextField("Enter your name", text: $userName)
-                                        .textFieldStyle(RoundedBorderTextFieldStyle())
+                                    Text(userName.isEmpty ? "Not set" : userName)
                                         .font(DesignSystem.Typography.bodyMedium)
+                                        .foregroundColor(DesignSystem.Colors.text)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
                                 }
+                                .frame(maxWidth: .infinity, alignment: .leading)
                                 
                                 // TLS Address Field
                                 VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
@@ -1423,8 +1279,15 @@ struct P2PSettingsView: View {
             }
         }
         .onAppear {
-            // Load user's TLS address from wallet service without fallback
-            tlsAddress = WalletService.shared.loadAddress() ?? ""
+            tlsAddress = WalletService.shared.loadAddress()
+                ?? AppGroupsService.shared.getTLSAddress()
+                ?? ""
+            userName = AppGroupsService.shared.profileDisplayName(tls: tlsAddress)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .zeroaDisplayNameDidChange)) { note in
+            if let name = note.object as? String {
+                userName = name
+            }
         }
         .alert("Copied!", isPresented: $showCopiedAlert) {
             Button("OK") { }
@@ -1625,6 +1488,5 @@ struct ConnectionStatusRow: View {
         .padding(.horizontal, DesignSystem.Spacing.md)
         .background(DesignSystem.Colors.surface)
         .clipShape(RoundedRectangle(cornerRadius: 8))
-}
     }
-} 
+}

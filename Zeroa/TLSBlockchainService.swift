@@ -108,7 +108,11 @@ actor BlockHeightCacheBox {
 class TLSBlockchainService: ObservableObject {
     static let shared = TLSBlockchainService()
     
-    private let baseURL = "https://telestai.cryptoscope.io/api"
+    // Address lookups: Cryptoscope on mainnet. TestNet 3.0.1 soak via TLSNetwork.
+    // Network stats / health from explorer `/api/status` (algo + subversion).
+    private var cryptoscopeBaseURL: String { TLSNetwork.current.apiBaseURL }
+    private var explorerBaseURL: String { TLSNetwork.current.explorerBaseURL }
+    private var baseURL: String { cryptoscopeBaseURL }
     private let walletService = WalletService.shared
     
     @Published var isConnected = false
@@ -127,7 +131,7 @@ class TLSBlockchainService: ObservableObject {
     private var hasPerformedAddressDiscovery = false
     private var isDiscoveringAddresses = false
     
-    private let addressDiscoveryGapLimit: UInt32 = 5
+    private let addressDiscoveryGapLimit: UInt32 = 20
     
     private var verboseLogsEnabled: Bool {
         ProcessInfo.processInfo.environment["ZEROA_VERBOSE_TLS_LOGS"] == "1"
@@ -135,7 +139,7 @@ class TLSBlockchainService: ObservableObject {
     
     // MARK: - Network Methods
     func checkConnection() async -> Bool {
-        guard let url = URL(string: "\(baseURL)/stats/") else { return false }
+        guard let url = URL(string: "\(explorerBaseURL)/api/status") else { return false }
         
         do {
             let (_, response) = try await URLSession.shared.data(from: url)
@@ -149,6 +153,35 @@ class TLSBlockchainService: ObservableObject {
         
         isConnected = false
         return false
+    }
+
+    struct ExplorerNetworkStatus: Decodable {
+        let demo: Bool?
+        let blocks: Int
+        let headers: Int?
+        let difficulty: Double
+        let chain: String
+        let networkhashps: Double?
+        let subversion: String?
+        let connections: Int?
+        let mempool: Int?
+        let algo: String?
+    }
+
+    func fetchNetworkStatus() async throws -> ExplorerNetworkStatus {
+        guard let url = URL(string: "\(explorerBaseURL)/api/status") else {
+            throw URLError(.badURL)
+        }
+        let (data, response) = try await URLSession.shared.data(from: url)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw URLError(.badServerResponse)
+        }
+        let status = try JSONDecoder().decode(ExplorerNetworkStatus.self, from: data)
+        await MainActor.run {
+            lastBlockHeight = status.blocks
+            isConnected = true
+        }
+        return status
     }
     
     func getAddressInfo(address: String) async -> TLSAddress? {
@@ -754,8 +787,13 @@ class TLSBlockchainService: ObservableObject {
     /// Sum balances across every derived receive/change address so the UI always shows the true total.
     private func refreshAggregatedBalance() async {
         var addressSet = Set(AddressManager.shared.getAllUsedAddresses())
-        if let primary = walletService.loadAddress() {
+        if let primary = walletService.loadAddress(), !primary.isEmpty {
             addressSet.insert(primary)
+        }
+        // Also include App Groups TLS hint (Chief / LASKO identity) when present —
+        // keeps aggregated balance aligned with the address users expect to see.
+        if let shared = AppGroupsService.shared.getTLSAddress(), !shared.isEmpty {
+            addressSet.insert(shared)
         }
         guard !addressSet.isEmpty else { return }
         
@@ -780,14 +818,8 @@ class TLSBlockchainService: ObservableObject {
         await withTaskGroup(of: (String, Double)?.self) { group in
             for address in addressSet {
                 group.addTask {
-                    do {
-                        let utxos = try await TLSRPCClient.shared.listUnspent(address: address)
-                        let addressTotal = utxos.reduce(0.0) { $0 + $1.amount }
-                        return (address, addressTotal)
-                    } catch {
-                        print("⚠️ TLSBlockchainService: Could not fetch UTXOs for \(address): \(error.localizedDescription)")
-                        return nil
-                    }
+                    let total = await self.fetchAddressUTXOBalance(address: address)
+                    return (address, total)
                 }
             }
             
@@ -1122,11 +1154,18 @@ class TLSBlockchainService: ObservableObject {
     private func fetchAddressUTXOBalance(address: String) async -> Double {
         do {
             let utxos = try await TLSRPCClient.shared.listUnspent(address: address)
-            return utxos.reduce(0.0) { $0 + $1.amount }
+            let utxoTotal = utxos.reduce(0.0) { $0 + $1.amount }
+            if utxoTotal > 0 {
+                return utxoTotal
+            }
         } catch {
             print("⚠️ TLSBlockchainService: Could not fetch UTXOs for \(address): \(error.localizedDescription)")
-            return 0.0
         }
+        
+        if let explorerInfo = await fetchExplorerAddressInfo(address: address) {
+            return explorerInfo.balance
+        }
+        return 0.0
     }
     
     /// Derive private key for a specific address (needed when UTXOs come from multiple addresses)
@@ -1444,8 +1483,12 @@ class TLSBlockchainService: ObservableObject {
         let receiveInfos = AddressManager.shared.getUsedReceiveAddressInfos()
         let changeInfos = AddressManager.shared.getUsedChangeAddressInfos()
         var combinedAddresses = (receiveInfos.map { $0.address } + changeInfos.map { $0.address })
-        if combinedAddresses.isEmpty, let primary = walletService.loadAddress() {
-            combinedAddresses = [primary]
+        // Always include the primary keychain address.
+        if let primary = walletService.loadAddress(), !primary.isEmpty {
+            combinedAddresses.insert(primary, at: 0)
+        }
+        if let shared = AppGroupsService.shared.getTLSAddress(), !shared.isEmpty {
+            combinedAddresses.append(shared)
         }
         let addressesToCheck = combinedAddresses.deduplicated()
         guard !addressesToCheck.isEmpty else {
@@ -1542,7 +1585,9 @@ class TLSBlockchainService: ObservableObject {
             gapLimit: addressDiscoveryGapLimit,
             scanReceiveOnly: true
         ) { address in
-            // Fast RPC check: does this address have any UTXOs?
+            if let info = await self.getAddressInfo(address: address), info.hasActivity {
+                return true
+            }
             do {
                 let utxos = try await TLSRPCClient.shared.listUnspent(address: address)
                 return !utxos.isEmpty
@@ -1551,7 +1596,8 @@ class TLSBlockchainService: ObservableObject {
             }
         }
         
-        hasPerformedAddressDiscovery = discoveredViaDerivation
+        // Always mark complete so we don't skip explorer fallback forever on empty UTXO index.
+        hasPerformedAddressDiscovery = true
         print("✅ TLSBlockchainService: Address discovery complete (derivation=\(discoveredViaDerivation))")
     }
     

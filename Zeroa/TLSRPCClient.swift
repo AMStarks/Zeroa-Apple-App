@@ -88,9 +88,9 @@ struct SigningError: Codable {
 class TLSRPCClient {
     static let shared = TLSRPCClient()
     
-    // Use Halo API as proxy to RPC (more secure than direct RPC access)
-    // Route is mounted at /api/tls, so /rpc becomes /api/tls/rpc
-    private let defaultBaseURL = "https://halo.telestai.io/api/tls"
+    // Use Halo API as proxy to RPC on mainnet (more secure than direct RPC access).
+    // TestNet uses TLSNetwork.rpcBaseURL (Optimus soak proxy). Route: …/rpc.
+    private var defaultBaseURL: String { TLSNetwork.current.rpcBaseURL }
     private let baseURLOVerrideDefaultsKey = "zeroa_rpc_base_url_override"
     private let overrideMigrationDefaultsKey = "zeroa_rpc_override_migration_v1"
     private let userDefaults = UserDefaults.standard

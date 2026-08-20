@@ -5,42 +5,71 @@ import UIKit
 struct LASKOApp: App {
     @StateObject private var laskoService = LASKOService()
     @StateObject private var authUIState = AuthUIState()
+    @StateObject private var appLockController = LASKOAppLockController()
     
     var body: some Scene {
         WindowGroup {
-            ContentView()
-                .environmentObject(laskoService)
-                .environmentObject(authUIState)
-                .task {
-                    // Pre-warm Halo token to reduce latency for upcoming fetches
-                    await laskoService.prewarmHaloTokenIfPossible()
+            ZStack {
+                ContentView()
+                    .environmentObject(laskoService)
+                    .environmentObject(authUIState)
+                    .environmentObject(appLockController)
+
+                if appLockController.isLocked {
+                    LASKOAppLockOverlay(controller: appLockController)
+                        .transition(.opacity)
+                        .zIndex(1)
                 }
-                // Re-enabled deep link callback and foreground listeners
-                .onOpenURL { url in
-                    // Expecting: lasko://auth/callback
-                    guard url.scheme?.lowercased() == "lasko" else { return }
-                    if url.host?.lowercased() == "auth", url.path.lowercased().contains("callback") {
-                        // Consume any pending response and update UI
-                        laskoService.checkForAuthResponse()
-                        if laskoService.isAuthenticatedWithZeroa {
-                            DispatchQueue.main.async {
-                                authUIState.step = .approved
-                            }
-                        }
-                    }
+            }
+            .animation(.easeInOut(duration: 0.2), value: appLockController.isLocked)
+            .task {
+                laskoService.prepareSessionForLaunch()
+                laskoService.observePostingKeySignals()
+                appLockController.prepareForLaunch()
+                await laskoService.prewarmHaloTokenIfPossible()
+                if laskoService.restoreZeroaSessionFromAppGroups() {
+                    authUIState.step = .approved
                 }
-                .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
-                    // When returning from Zeroa, check App Groups for a response
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                        laskoService.checkForAuthResponse()
-                        if laskoService.isAuthenticatedWithZeroa {
+            }
+            .onOpenURL { url in
+                guard url.scheme?.lowercased() == "lasko" else { return }
+                if url.host?.lowercased() == "auth", url.path.lowercased().contains("callback") {
+                    laskoService.checkForAuthResponse()
+                    if laskoService.isAuthenticatedWithZeroa {
+                        DispatchQueue.main.async {
                             authUIState.step = .approved
                         }
                     }
                 }
+                if url.host?.lowercased() == "posting-key" {
+                    DispatchQueue.main.async {
+                        laskoService.needsOpenZeroaToSign = false
+                        laskoService.errorMessage = nil
+                    }
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+                appLockController.lockIfEnabled()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    laskoService.syncIdentityWithAppGroups()
+                    if laskoService.isAuthenticatedWithZeroa {
+                        authUIState.step = .approved
+                    } else {
+                        laskoService.checkForAuthResponse()
+                    }
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+                appLockController.lockIfEnabled()
+            }
+            .onChange(of: laskoService.isAuthPolling, initial: false) { _, polling in
+                if !polling && !laskoService.isAuthenticatedWithZeroa {
+                    authUIState.step = .idle
+                }
+            }
         }
     }
-} 
+}
 
 enum AuthUIStep {
     case idle

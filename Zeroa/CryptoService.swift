@@ -239,6 +239,75 @@ final class CryptoService {
             return nil
         }
     }
+
+    // MARK: - Switchboard E2E (secp256k1 ECDH + AES-GCM)
+
+    /// Encrypt plaintext for a recipient compressed pubkey.
+    /// Returns base64(JSON) envelope: {v,epk,n,c}
+    func encryptDirectMessage(
+        plaintext: String,
+        recipientCompressedPubkeyHex: String,
+        keychain: KeychainService
+    ) -> String? {
+        guard let plainData = plaintext.data(using: .utf8) else { return nil }
+        guard let recipientPubData = Data(hexString: recipientCompressedPubkeyHex),
+              recipientPubData.count == 33 else { return nil }
+        do {
+            let ephemeral = try Secp.KeyAgreement.PrivateKey()
+            let recipientPub = try Secp.KeyAgreement.PublicKey(dataRepresentation: recipientPubData, format: .compressed)
+            let shared = try ephemeral.sharedSecretFromKeyAgreement(with: recipientPub, format: .compressed)
+            let symmetric = SymmetricKey(data: Data(SHA256.hash(data: shared.bytes)))
+            let sealed = try AES.GCM.seal(plainData, using: symmetric)
+            guard let combined = sealed.combined else { return nil }
+            let epk = ephemeral.publicKey.dataRepresentation.map { String(format: "%02x", $0) }.joined()
+            let envelope: [String: Any] = [
+                "v": 1,
+                "epk": epk,
+                "c": combined.base64EncodedString(),
+            ]
+            let json = try JSONSerialization.data(withJSONObject: envelope)
+            return json.base64EncodedString()
+        } catch {
+            print("❌ CryptoService.encryptDirectMessage: \(error)")
+            return nil
+        }
+    }
+
+    /// Decrypt Switchboard envelope produced by encryptDirectMessage.
+    func decryptDirectMessage(
+        payload: String,
+        keychain: KeychainService
+    ) -> String? {
+        // Accept raw JSON or base64(JSON)
+        let jsonData: Data?
+        if let d = Data(base64Encoded: payload),
+           (try? JSONSerialization.jsonObject(with: d)) != nil {
+            jsonData = d
+        } else {
+            jsonData = payload.data(using: .utf8)
+        }
+        guard let jsonData,
+              let obj = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+              let epkHex = obj["epk"] as? String,
+              let cB64 = obj["c"] as? String,
+              let epkData = Data(hexString: epkHex),
+              let cipherData = Data(base64Encoded: cB64),
+              let privHex = keychain.read(key: "wallet_private_key"),
+              let privKeyData = Data(hexString: privHex),
+              privKeyData.count == 32 else { return nil }
+        do {
+            let myPriv = try Secp.KeyAgreement.PrivateKey(dataRepresentation: privKeyData)
+            let epk = try Secp.KeyAgreement.PublicKey(dataRepresentation: epkData, format: .compressed)
+            let shared = try myPriv.sharedSecretFromKeyAgreement(with: epk, format: .compressed)
+            let symmetric = SymmetricKey(data: Data(SHA256.hash(data: shared.bytes)))
+            let box = try AES.GCM.SealedBox(combined: cipherData)
+            let plain = try AES.GCM.open(box, using: symmetric)
+            return String(data: plain, encoding: .utf8)
+        } catch {
+            print("❌ CryptoService.decryptDirectMessage: \(error)")
+            return nil
+        }
+    }
 }
 
 // MARK: - Utilities

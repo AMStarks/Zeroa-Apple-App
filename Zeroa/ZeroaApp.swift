@@ -16,10 +16,12 @@ struct ZeroaApp: App {
             ContentView()
                 .environmentObject(authManager)
                 .onOpenURL { url in
-                    handleLASKORequest(url)
+                    handleIncomingURL(url)
                 }
                 .onAppear {
                     TLSRPCClient.shared.performLegacyOverrideMigrationIfNeeded()
+                    // Restore Chief profile into the new App Group / sandbox after bundle rename.
+                    ProfileLegacyMigration.runIfNeeded()
                     // Ensure profile is active if user is authenticated
                     if authManager.isAuthenticated {
                         AppGroupsService.shared.setProfileActive(true)
@@ -90,6 +92,10 @@ struct ZeroaApp: App {
                     print("🔔 Zeroa: Received HandleTokenRefreshRequest notification")
                     handleBackgroundHandshakes()
                 }
+                .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("HandleLASKOAuthRequest"))) { _ in
+                    print("🔔 Zeroa: Received HandleLASKOAuthRequest notification")
+                    checkForPendingLASKORequests()
+                }
         }
     }
     
@@ -140,6 +146,23 @@ struct ZeroaApp: App {
             nil,
             tokenRefreshCallback,
             tokenRefreshNotificationName,
+            nil,
+            .deliverImmediately
+        )
+
+        // Register for LASKO login / identity auth requests
+        let authRequestNotificationName = "com.telestai.lasko.auth.request" as CFString
+        let authRequestCallback: @convention(c) (CFNotificationCenter?, UnsafeMutableRawPointer?, CFNotificationName?, UnsafeRawPointer?, CFDictionary?) -> Void = { (center, observer, name, object, userInfo) in
+            print("📢 Zeroa: Received Darwin notification for LASKO auth request")
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: NSNotification.Name("HandleLASKOAuthRequest"), object: nil)
+            }
+        }
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            nil,
+            authRequestCallback,
+            authRequestNotificationName,
             nil,
             .deliverImmediately
         )
@@ -274,6 +297,17 @@ struct ZeroaApp: App {
         }
     }
     
+    private func handleIncomingURL(_ url: URL) {
+        guard url.scheme == "zeroa" else { return }
+        if url.host == "backup" {
+            print("🔗 Zeroa: Opening seed security from zeroa://backup")
+            AppGroupsService.shared.setPendingOpenSeedSecurity(true)
+            NotificationCenter.default.post(name: .zeroaOpenSeedSecurity, object: nil)
+            return
+        }
+        handleLASKORequest(url)
+    }
+
     private func handleLASKORequest(_ url: URL) {
         print("🔗 Received URL scheme request: \(url)")
         

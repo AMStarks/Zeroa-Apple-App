@@ -1,6 +1,9 @@
 import SwiftUI
 import Combine
 import AVFoundation
+import CoreImage
+import CoreImage.CIFilterBuiltins
+import UIKit
 
 // MARK: - Send/Receive Models
 struct SendTransactionData {
@@ -865,10 +868,10 @@ struct ReceiveTransactionView: View {
     private func generateReceiveAddress() {
         switch receiveData.coinType {
         case .telestai:
-            // Use AddressManager to get next receive address (address rotation)
-            if let addr = AddressManager.shared.getNextReceiveAddress() {
+            // Always show the primary wallet address — do not rotate on every open.
+            if let addr = walletService.loadAddress(), !addr.isEmpty {
                 receiveData.address = addr
-            } else if let addr = walletService.loadAddress() {
+            } else if let addr = AddressManager.shared.getCurrentReceiveAddress() {
                 receiveData.address = addr
             } else {
                 receiveData.address = ""
@@ -882,17 +885,26 @@ struct ReceiveTransactionView: View {
     }
     
     private func generateQRCode() {
-        // Generate QR code for the address
-        let qrCodeString = receiveData.address
-        if let qrCodeData = generateQRCodeData(from: qrCodeString) {
-            receiveData.qrCodeData = qrCodeData
+        let qrCodeString = receiveData.address.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !qrCodeString.isEmpty,
+              let qrCodeData = generateQRCodeData(from: qrCodeString) else {
+            receiveData.qrCodeData = nil
+            return
         }
+        receiveData.qrCodeData = qrCodeData
     }
     
     private func generateQRCodeData(from string: String) -> Data? {
-        // Simple QR code generation - in real app, use a proper QR library
-        guard let data = string.data(using: .utf8) else { return nil }
-        return data
+        let context = CIContext()
+        let filter = CIFilter.qrCodeGenerator()
+        filter.message = Data(string.utf8)
+        filter.correctionLevel = "M"
+        
+        guard let outputImage = filter.outputImage else { return nil }
+        let scale = max(1, 200 / outputImage.extent.width)
+        let scaled = outputImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        guard let cgImage = context.createCGImage(scaled, from: scaled.extent) else { return nil }
+        return UIImage(cgImage: cgImage).pngData()
     }
     
     private func copyAddressToClipboard() {

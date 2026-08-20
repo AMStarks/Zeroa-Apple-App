@@ -5,7 +5,7 @@ class AppGroupsService {
     static let shared = AppGroupsService()
     
     // App Group identifier - both apps will use this
-    private let appGroupIdentifier = "group.com.telestai.zeroa-lasko"
+    private let appGroupIdentifier = "group.com.tls.zeroa-lasko"
     private let profileAccountActiveKey = "profile_account_active"
     let sharedDefaults: UserDefaults?
     
@@ -434,6 +434,38 @@ class AppGroupsService {
         return sharedDefaults?.string(forKey: "tls_wallet_address")
     }
 
+    // MARK: - Profile display name (shared with Switchboard)
+    private let profileDisplayNameKey = "profile_display_name"
+
+    func profileDisplayName(tls: String?) -> String {
+        let defaults = sharedDefaults ?? .standard
+        defaults.synchronize()
+        let trimmedTLS = tls?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !trimmedTLS.isEmpty,
+           let scoped = defaults.string(forKey: "\(profileDisplayNameKey)_\(trimmedTLS)"),
+           !scoped.isEmpty {
+            return scoped
+        }
+        if let global = defaults.string(forKey: profileDisplayNameKey), !global.isEmpty {
+            return global
+        }
+        return ""
+    }
+
+    func setProfileDisplayName(_ name: String, tls: String?) {
+        let defaults = sharedDefaults ?? .standard
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedTLS = tls?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let existing = profileDisplayName(tls: trimmedTLS.isEmpty ? nil : trimmedTLS)
+        if existing == trimmed { return }
+        defaults.set(trimmed, forKey: profileDisplayNameKey)
+        if !trimmedTLS.isEmpty {
+            defaults.set(trimmed, forKey: "\(profileDisplayNameKey)_\(trimmedTLS)")
+        }
+        defaults.synchronize()
+        NotificationCenter.default.post(name: .zeroaDisplayNameDidChange, object: trimmed)
+    }
+
     // MARK: - Flux Address Storage
     func storeFluxAddress(_ address: String) {
         sharedDefaults?.set(address, forKey: "flux_wallet_address")
@@ -460,5 +492,19 @@ class AppGroupsService {
     func setProfileActive(_ isActive: Bool) {
         sharedDefaults?.set(isActive, forKey: profileAccountActiveKey)
         sharedDefaults?.synchronize()
+    }
+
+    private let openSeedSecurityPendingKey = "zeroa_open_seed_security_pending"
+
+    func setPendingOpenSeedSecurity(_ pending: Bool) {
+        sharedDefaults?.set(pending, forKey: openSeedSecurityPendingKey)
+        sharedDefaults?.synchronize()
+    }
+
+    func consumePendingOpenSeedSecurity() -> Bool {
+        guard sharedDefaults?.bool(forKey: openSeedSecurityPendingKey) == true else { return false }
+        sharedDefaults?.set(false, forKey: openSeedSecurityPendingKey)
+        sharedDefaults?.synchronize()
+        return true
     }
 }

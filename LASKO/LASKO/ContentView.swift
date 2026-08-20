@@ -6,11 +6,10 @@ struct ContentView: View {
     @State private var showingProfile = false
     @EnvironmentObject var laskoService: LASKOService
     @EnvironmentObject private var authUIState: AuthUIState
-    @State private var showApprovalSheet = false
     @StateObject private var themeManager = LASKThemeManager.shared
     
     var body: some View {
-        NavigationView {
+        NavigationStack {
             ZStack {
                 // Force dark mode background for welcome screen
                 Color(red: 0.15, green: 0.15, blue: 0.15) // Charcoal background
@@ -95,9 +94,6 @@ struct ContentView: View {
                             .padding(.vertical, 8)
                             .background(Color(red: 0.1, green: 0.1, blue: 0.1).opacity(0.8)) // Force dark background
                             .cornerRadius(20)
-                            .onTapGesture {
-                                showApprovalSheet = true
-                            }
                         }
                     }
                     .padding(.top, 60)
@@ -135,15 +131,17 @@ struct ContentView: View {
                         // Primary action button
                         Button(action: {
                             print("Get Started button tapped")
-                            if laskoService.isAuthenticatedWithZeroa {
+                            if laskoService.isAuthenticatedWithZeroa || laskoService.restoreZeroaSessionFromAppGroups() {
                                 showingFeed = true
                             } else {
-                                // Always start explicit connect flow and store request
                                 DispatchQueue.main.async {
                                     authUIState.step = .waiting
-                                    showApprovalSheet = true
                                 }
                                 laskoService.requestZeroaAuthentication()
+                                if laskoService.isAuthenticatedWithZeroa {
+                                    authUIState.step = .approved
+                                    showingFeed = true
+                                }
                             }
                         }) {
                             HStack(spacing: 12) {
@@ -193,20 +191,16 @@ struct ContentView: View {
                 }
             }
             .navigationBarHidden(true)
-            .background(
-                NavigationLink(destination: ModernFeedView()
-                        .navigationTitle("LASKO Feed")
-                    .navigationBarTitleDisplayMode(.large), isActive: $showingFeed) {
-                    EmptyView()
-                }
-            )
-            .background(
-                NavigationLink(destination: ModernProfileView()
-                        .navigationTitle("Profile")
-                    .navigationBarTitleDisplayMode(.large), isActive: $showingProfile) {
-                    EmptyView()
-                }
-            )
+            .navigationDestination(isPresented: $showingFeed) {
+                ModernFeedView()
+                    .navigationTitle("LASKO Feed")
+                    .navigationBarTitleDisplayMode(.large)
+            }
+            .navigationDestination(isPresented: $showingProfile) {
+                ModernProfileView()
+                    .navigationTitle("Profile")
+                    .navigationBarTitleDisplayMode(.large)
+            }
         }
         .onAppear {
             // If Zeroa isn't installed/running and button is tapped, the request will be stored.
@@ -220,11 +214,6 @@ struct ContentView: View {
                     showingFeed = true
                 }
             }
-        }
-        .sheet(isPresented: $showApprovalSheet) {
-            ZeroaApprovalSheet()
-                .environmentObject(laskoService)
-                .environmentObject(authUIState)
         }
     }
 
@@ -316,6 +305,31 @@ struct ModernFeedView: View {
     @State private var showSupportSheet = false
     @State private var showSideMenu = false
     @State private var selectedProfileAddress: String? = nil
+    @State private var feedMode: LASKOFeedMode = .following
+    @State private var followingPosts: [Post] = []
+    @State private var forYouPosts: [Post] = []
+    @State private var isLoadingFollowing = false
+    @State private var isLoadingForYou = false
+    @State private var showActivity = false
+
+    private var visiblePosts: [Post] {
+        switch feedMode {
+        case .global: return laskoService.posts
+        case .following: return followingPosts
+        case .forYou: return forYouPosts
+        }
+    }
+
+    private var isInitialLoading: Bool {
+        switch feedMode {
+        case .global:
+            return laskoService.isLoading && laskoService.posts.isEmpty
+        case .following:
+            return isLoadingFollowing && followingPosts.isEmpty
+        case .forYou:
+            return isLoadingForYou && forYouPosts.isEmpty
+        }
+    }
     
     var body: some View {
         ZStack {
@@ -325,42 +339,45 @@ struct ModernFeedView: View {
             
             VStack(spacing: 0) {
                 // Header with logo, profile and menu
-                HStack {
-                    // Profile image (36x36) - top left
-                    NavigationLink(destination: ModernProfileView()) {
-                        if let syncedImage = AppGroupsService.shared.getProfileImage() {
-                            Image(uiImage: syncedImage)
-                                .resizable()
-                                .aspectRatio(contentMode: .fill)
-                                .frame(width: 32, height: 32)
-                                .clipShape(Circle())
-                                .overlay(
-                                    Circle()
-                                        .stroke(Color.white.opacity(0.2), lineWidth: 1)
-                                )
-                                .shadow(color: Color(red: 1.0, green: 0.6, blue: 0.0).opacity(0.3), radius: 8, x: 0, y: 4)
-                        } else {
-                            Circle()
-                                .fill(
-                                    LinearGradient(
-                                        colors: [
-                                            Color(red: 1.0, green: 0.6, blue: 0.0),
-                                            Color(red: 1.0, green: 0.4, blue: 0.0)
-                                        ],
-                                        startPoint: .topLeading,
-                                        endPoint: .bottomTrailing
+                HStack(spacing: 8) {
+                    // Profile image (36x36) - top left + posting-key status light
+                    HStack(spacing: 6) {
+                        NavigationLink(destination: ModernProfileView()) {
+                            if let syncedImage = AppGroupsService.shared.getProfileImage(for: laskoService.currentTLSAddress) {
+                                Image(uiImage: syncedImage)
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fill)
+                                    .frame(width: 36, height: 36)
+                                    .clipShape(Circle())
+                                    .overlay(
+                                        Circle()
+                                            .stroke(Color.white.opacity(0.2), lineWidth: 1)
                                     )
-                                )
-                                .frame(width: 32, height: 32)
-                                .overlay(
-                                    Text(laskoService.username.prefix(1).uppercased())
-                                        .font(.system(size: 16, weight: .bold))
-                                        .foregroundColor(.white)
-                                )
-                                .shadow(color: Color(red: 1.0, green: 0.6, blue: 0.0).opacity(0.3), radius: 8, x: 0, y: 4)
+                                    .shadow(color: Color(red: 1.0, green: 0.6, blue: 0.0).opacity(0.3), radius: 8, x: 0, y: 4)
+                            } else {
+                                Circle()
+                                    .fill(
+                                        LinearGradient(
+                                            colors: [
+                                                Color(red: 1.0, green: 0.6, blue: 0.0),
+                                                Color(red: 1.0, green: 0.4, blue: 0.0)
+                                            ],
+                                            startPoint: .topLeading,
+                                            endPoint: .bottomTrailing
+                                        )
+                                    )
+                                    .frame(width: 36, height: 36)
+                                    .overlay(
+                                        Text(laskoService.username.prefix(1).uppercased())
+                                            .font(.system(size: 16, weight: .bold))
+                                            .foregroundColor(.white)
+                                    )
+                                    .shadow(color: Color(red: 1.0, green: 0.6, blue: 0.0).opacity(0.3), radius: 8, x: 0, y: 4)
+                            }
                         }
+                        LASKOPostingKeyStatusDot()
                     }
-                    
+
                     Spacer()
                     
                     // Logo (36x36) - center top (SVG)
@@ -371,6 +388,13 @@ struct ModernFeedView: View {
                         .frame(width: 36, height: 36)
                         
                     Spacer()
+
+                    Button(action: { showActivity = true }) {
+                        Image(systemName: "bell")
+                            .font(.system(size: 20, weight: .semibold))
+                            .foregroundColor(LASKDesignSystem.Colors.text)
+                    }
+                    .padding(.trailing, 12)
                         
                     // Hamburger menu (top right) - opens slide-out menu
                     Button(action: { withAnimation(.easeInOut(duration: 0.25)) { showSideMenu = true } }) {
@@ -381,23 +405,58 @@ struct ModernFeedView: View {
                 }
                 .padding(.horizontal, 20)
                 .padding(.top, 10)
-                .padding(.bottom, 20)
+                .padding(.bottom, 8)
                 .sheet(isPresented: $showFluxDriveSheet) { FluxDriveView() }
                 .sheet(isPresented: $showSubscriptionSheet) { SubscriptionSheetView() }
                 .sheet(isPresented: $showSettingsSheet) { LASKOSettingsView() }
                 .sheet(isPresented: $showSupportSheet) { LASKOSupportView() }
+
+                // X-style underline channel tabs
+                LASKOFeedChannelTabs(selection: $feedMode)
+                    .onChange(of: feedMode) { _, mode in
+                        Task { await reloadChannelIfNeeded(mode) }
+                    }
                 
                 // Posts feed
-                if laskoService.isLoading {
+                // Only show the full-screen spinner on the very first load (empty feed).
+                // On refresh/after posting, keep the existing feed on screen to avoid a
+                // jarring blank flash — pull-to-refresh shows its own indicator.
+                if isInitialLoading {
                     Spacer()
                     ProgressView()
                         .progressViewStyle(CircularProgressViewStyle(tint: LASKDesignSystem.Colors.primary))
                         .scaleEffect(1.5)
                     Spacer()
+                } else if feedMode == .following && followingPosts.isEmpty && !isLoadingFollowing {
+                    Spacer()
+                    VStack(spacing: 10) {
+                        Text("No posts from people you follow")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundColor(LASKDesignSystem.Colors.text)
+                        Text("Open a profile and tap Follow to build this feed.")
+                            .font(.system(size: 13))
+                            .foregroundColor(LASKDesignSystem.Colors.textSecondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 28)
+                    }
+                    Spacer()
+                } else if feedMode == .forYou && forYouPosts.isEmpty && !isLoadingForYou {
+                    Spacer()
+                    VStack(spacing: 10) {
+                        Text("Nothing in For You yet")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundColor(LASKDesignSystem.Colors.text)
+                        Text("Pull to refresh, or check Global while the network warms up.")
+                            .font(.system(size: 13))
+                            .foregroundColor(LASKDesignSystem.Colors.textSecondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 28)
+                    }
+                    Spacer()
                 } else {
                     ScrollView {
-                        LazyVStack(spacing: 0) {
-                            ForEach(laskoService.posts) { post in
+                        LazyVStack(spacing: 12) {
+                            ForEach(visiblePosts, id: \.feedKey) { post in
                                 ModernPostCard(post: post, onProfileTap: {
                                     if let address = post.tlsAddress {
                                         selectedProfileAddress = address
@@ -405,45 +464,46 @@ struct ModernFeedView: View {
                                 }) {
                                     selectedPost = post
                                 }
-                                .background(
-                                    NavigationLink(isActive: Binding(
-                                        get: { selectedPost?.id == post.id },
-                                        set: { active in 
-                                            if !active { 
-                                                selectedPost = nil
-                                                promotedCommentInComments = nil
-                                            }
-                                        }
-                                    )) {
-                                        CommentsView(postId: post.id, sequentialCode: post.id)
-                                            .navigationTitle("Comments")
-                                            .navigationBarTitleDisplayMode(.inline)
-                                            .environmentObject(laskoService)
-                                    } label: { EmptyView() }
-                                    .hidden()
-                                )
-                                .background(
-                                    NavigationLink(isActive: Binding(
-                                        get: { selectedProfileAddress == post.tlsAddress },
-                                        set: { active in 
-                                            if !active { 
-                                                selectedProfileAddress = nil
-                                            }
-                                        }
-                                    )) {
-                                        ModernProfileView(viewingAddress: post.tlsAddress)
-                                            .navigationTitle("Profile")
-                                            .navigationBarTitleDisplayMode(.inline)
-                                            .environmentObject(laskoService)
-                                    } label: { EmptyView() }
-                                    .hidden()
-                                )
                             }
                         }
                         .padding(.bottom, 100) // Extra padding for floating button
                     }
                     .refreshable {
-                        await laskoService.fetchPosts()
+                        await refreshCurrentChannel()
+                    }
+                    .navigationDestination(isPresented: Binding(
+                        get: { selectedPost != nil },
+                        set: { active in
+                            if !active {
+                                selectedPost = nil
+                                promotedCommentInComments = nil
+                            }
+                        }
+                    )) {
+                        if let post = selectedPost {
+                            let threadCode = laskoService.threadRootCode(for: post)
+                            CommentsView(postId: threadCode, sequentialCode: threadCode)
+                                .navigationTitle("Comments")
+                                .navigationBarTitleDisplayMode(.inline)
+                                .environmentObject(laskoService)
+                        }
+                    }
+                    .navigationDestination(isPresented: Binding(
+                        get: { selectedProfileAddress != nil },
+                        set: { active in
+                            if !active {
+                                selectedProfileAddress = nil
+                            }
+                        }
+                    )) {
+                        ModernProfileView(viewingAddress: selectedProfileAddress)
+                            .navigationTitle("Profile")
+                            .navigationBarTitleDisplayMode(.inline)
+                            .environmentObject(laskoService)
+                    }
+                    .navigationDestination(isPresented: $showActivity) {
+                        LASKOActivityInboxView()
+                            .environmentObject(laskoService)
                     }
                     // If unauthenticated, show a small inline banner but still show feed
                     if !laskoService.isAuthenticatedWithZeroa {
@@ -529,12 +589,140 @@ struct ModernFeedView: View {
         .navigationBarHidden(true)
         .sheet(isPresented: $showingPostComposer) {
             ModernPostComposerView()
+                .environmentObject(laskoService)
         }
         .onAppear {
             Task {
-                await laskoService.fetchPosts()
+                await laskoService.refreshFollowedAddresses()
+                if followingPosts.isEmpty {
+                    await reloadFollowing()
+                }
+                if laskoService.posts.isEmpty {
+                    await laskoService.fetchPosts()
+                }
             }
         }
+    }
+
+    private func reloadChannelIfNeeded(_ mode: LASKOFeedMode) async {
+        switch mode {
+        case .following:
+            if followingPosts.isEmpty { await reloadFollowing() }
+        case .forYou:
+            if forYouPosts.isEmpty { await reloadForYou() }
+        case .global:
+            if laskoService.posts.isEmpty { await laskoService.fetchPosts() }
+        }
+    }
+
+    private func refreshCurrentChannel() async {
+        switch feedMode {
+        case .global:
+            await laskoService.fetchPosts()
+        case .following:
+            await reloadFollowing()
+        case .forYou:
+            await reloadForYou(forceRefreshSources: true)
+        }
+    }
+
+    private func reloadFollowing() async {
+        isLoadingFollowing = true
+        let posts = await laskoService.loadFollowingFeed()
+        await MainActor.run {
+            followingPosts = posts
+            isLoadingFollowing = false
+        }
+    }
+
+    /// For You: engagement-ranked mix — boost posts from people you follow,
+    /// then score by likes/replies/announces + freshness.
+    private func reloadForYou(forceRefreshSources: Bool = false) async {
+        isLoadingForYou = true
+        if forceRefreshSources || laskoService.posts.isEmpty {
+            await laskoService.fetchPosts()
+        }
+        if forceRefreshSources || followingPosts.isEmpty {
+            let following = await laskoService.loadFollowingFeed()
+            await MainActor.run { followingPosts = following }
+        }
+        let followingAddresses = Set(followingPosts.compactMap { $0.tlsAddress }.filter { !$0.isEmpty })
+        let merged = mergeUnique(followingPosts + laskoService.posts)
+        let ranked = merged.sorted { a, b in
+            score(a, followingBoost: followingAddresses) > score(b, followingBoost: followingAddresses)
+        }
+        await MainActor.run {
+            forYouPosts = ranked
+            isLoadingFollowing = false
+            isLoadingForYou = false
+        }
+    }
+
+    private func mergeUnique(_ posts: [Post]) -> [Post] {
+        var seen = Set<String>()
+        var out: [Post] = []
+        for p in posts {
+            if seen.insert(p.feedKey).inserted {
+                out.append(p)
+            }
+        }
+        return out
+    }
+
+    private func score(_ post: Post, followingBoost: Set<String>) -> Double {
+        let engagement = Double(post.likes) + Double(post.replies) * 1.5 + Double(post.broadcastCount) * 2.0
+        let ageHours = max(0.25, Date().timeIntervalSince(post.timestamp) / 3600.0)
+        let freshness = 12.0 / ageHours
+        let boost = (post.tlsAddress.map { followingBoost.contains($0) } ?? false) ? 8.0 : 0.0
+        return engagement + freshness + boost
+    }
+}
+
+/// X-style text tabs with underline on the selected channel.
+private enum LASKOFeedMode: String, CaseIterable, Identifiable {
+    case following = "Following"
+    case global = "Global"
+    case forYou = "For You"
+    var id: String { rawValue }
+}
+
+private struct LASKOFeedChannelTabs: View {
+    @Binding var selection: LASKOFeedMode
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 0) {
+                ForEach(LASKOFeedMode.allCases) { mode in
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            selection = mode
+                        }
+                    } label: {
+                        VStack(spacing: 10) {
+                            Text(mode.rawValue)
+                                .font(.system(size: 15, weight: selection == mode ? .bold : .medium))
+                                .foregroundColor(
+                                    selection == mode
+                                    ? LASKDesignSystem.Colors.text
+                                    : LASKDesignSystem.Colors.textSecondary
+                                )
+                            Rectangle()
+                                .fill(selection == mode ? Color(red: 1.0, green: 0.6, blue: 0.0) : Color.clear)
+                                .frame(height: 3)
+                                .cornerRadius(1.5)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 8)
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .frame(height: 0.5)
+        }
+        .padding(.bottom, 8)
     }
 }
 
@@ -544,26 +732,61 @@ struct ModernPostCard: View {
     let onProfileTap: () -> Void
     let onTap: () -> Void
     @EnvironmentObject var laskoService: LASKOService
-    @State private var isCommented: Bool = false
-    @State private var isAnnounced: Bool = false
-    @State private var isLiked: Bool = false
     @State private var likesCount: Int = 0
+    @State private var broadcastCount: Int = 0
     @State private var showReplies: Bool = false
     @State private var inlineReplyText: String = ""
-    @State private var selectedPostID: String? = nil
+    @State private var isSubmittingInlineReply: Bool = false
+    @State private var showInlineReplyErrorAlert = false
+
+    private var userLiked: Bool {
+        _ = laskoService.userActionStateVersion
+        return laskoService.hasUserLikedPost(post.id)
+    }
+
+    private var userAnnounced: Bool {
+        _ = laskoService.userActionStateVersion
+        return laskoService.hasUserAnnouncedPost(post.id)
+    }
+
+    private var userCommented: Bool {
+        _ = laskoService.userActionStateVersion
+        return laskoService.hasUserCommentedOnPost(post.id)
+    }
     
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            if post.isAnnounceRepost {
+                HStack(spacing: 6) {
+                    Image(systemName: "megaphone.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.green)
+                    Text("\(laskoService.announcerDisplayName(for: post)) announced")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(LASKDesignSystem.Colors.textSecondary)
+                    Spacer()
+                    if let announcedAt = post.announcedAt {
+                        Text(timeAgoString(from: announcedAt))
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(LASKDesignSystem.Colors.textSecondary)
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 12)
+                .padding(.bottom, 4)
+            }
+
             // Profile section - tappable to go to profile
             HStack(spacing: 12) {
                 // User avatar - tappable
                 Button(action: onProfileTap) {
                     // Always prioritize App Groups profile image for current user's posts
+                    Group {
                     if let postTLS = post.tlsAddress,
                        let currentTLS = laskoService.currentTLSAddress,
                        postTLS == currentTLS {
                         // Current user's post - check App Groups first
-                        if let userAvatar = AppGroupsService.shared.getProfileImage() {
+                        if let userAvatar = AppGroupsService.shared.getProfileImage(for: laskoService.currentTLSAddress) {
                             // Current user's avatar from App Groups
                             Image(uiImage: userAvatar)
                                 .resizable()
@@ -586,7 +809,7 @@ struct ModernPostCard: View {
                                         )
                                     )
                                     .frame(width: 29, height: 29)
-                                Text(String(post.author.prefix(1)))
+                                Text(String(laskoService.feedDisplayName(for: post).prefix(1)))
                                     .font(.system(size: 12, weight: .bold))
                                     .foregroundColor(.white)
                             }
@@ -640,18 +863,29 @@ struct ModernPostCard: View {
                                     )
                                 )
                                 .frame(width: 29, height: 29)
-                            Text(String(post.author.prefix(1)))
+                            Text(String(laskoService.feedDisplayName(for: post).prefix(1)))
                                 .font(.system(size: 12, weight: .bold))
                                 .foregroundColor(.white)
                         }
                     }
+                    }
+                    .overlay(
+                        Circle()
+                            .strokeBorder(
+                                (post.tlsAddress != laskoService.currentTLSAddress && laskoService.isFollowing(post.tlsAddress))
+                                ? Color.green
+                                : Color.clear,
+                                lineWidth: 2
+                            )
+                            .frame(width: 33, height: 33)
+                    )
                 }
                 .buttonStyle(PlainButtonStyle())
                 
                 // Username and time - tappable
                 Button(action: onProfileTap) {
                     HStack(spacing: 8) {
-                        Text(post.author)
+                        Text(laskoService.feedDisplayName(for: post))
                             .font(.system(size: 14, weight: .bold))
                             .foregroundColor(LASKDesignSystem.Colors.text)
                         Text(timeAgoString(from: post.timestamp))
@@ -686,51 +920,70 @@ struct ModernPostCard: View {
                     .fill(Color.white.opacity(0.05))
             )
             
-            // Rest of post - tappable to go to comments
-            Button(action: onTap) {
-                VStack(alignment: .leading, spacing: 16) {
+            // Rest of post - body opens thread; action buttons remain independent.
+            VStack(alignment: .leading, spacing: 16) {
+                    if post.isReply {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrowshape.turn.up.left")
+                                .font(.system(size: 12, weight: .semibold))
+                            Text("Reply")
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                        .foregroundColor(LASKDesignSystem.Colors.textSecondary)
+                    }
+
                     // Post content
                     Text(post.content)
                             .font(.system(size: 14, weight: .regular))
                             .foregroundColor(LASKDesignSystem.Colors.text)
                             .multilineTextAlignment(.leading)
                             .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                            .onTapGesture { onTap() }
 
                     
                     // Post actions (evenly spaced across the card) - WITHOUT THREE DOTS
+                    let _ = laskoService.userActionStateVersion
                     HStack(spacing: 0) {
                         // Message (comment) first
                         Button(action: {
-                            isCommented.toggle()
                             withAnimation { showReplies.toggle() }
-                            // Prefetch comments regardless of displayed count
                             Task { await laskoService.fetchComments(forSequentialCode: post.id) }
-                            if showReplies {
-                                // already fetched above; toggle visibility
-                            }
                         }) {
                             HStack(spacing: 4) {
                                 Image(systemName: "message")
                                     .font(.system(size: 16, weight: .medium))
-                                    .foregroundColor(isCommented ? Color(red: 0.35, green: 0.75, blue: 1.0) : LASKDesignSystem.Colors.textSecondary)
+                                    .foregroundColor(userCommented ? Color(red: 0.35, green: 0.75, blue: 1.0) : LASKDesignSystem.Colors.textSecondary)
                                 Text("\(max(laskoService.repliesByCode[post.id]?.count ?? 0, post.replies))")
                                     .font(.system(size: 10, weight: .medium))
-                                    .foregroundColor(isCommented ? Color(red: 0.35, green: 0.75, blue: 1.0) : LASKDesignSystem.Colors.text)
+                                    .foregroundColor(userCommented ? Color(red: 0.35, green: 0.75, blue: 1.0) : LASKDesignSystem.Colors.text)
                             }
                         }
                         .buttonStyle(PlainButtonStyle())
 
                         Spacer()
 
-                        // Broadcast (share)
-                        Button(action: { isAnnounced.toggle() }) {
+                        // Broadcast (share) — tap again to un-announce
+                        Button(action: {
+                            Task {
+                                if userAnnounced {
+                                    if broadcastCount > 0 { broadcastCount -= 1 }
+                                } else {
+                                    broadcastCount += 1
+                                }
+                                await laskoService.announcePost(post)
+                                if let updated = laskoService.posts.first(where: { $0.id == post.id }) {
+                                    broadcastCount = updated.broadcastCount
+                                }
+                            }
+                        }) {
                             HStack(spacing: 4) {
                                 Image(systemName: "megaphone")
                                     .font(.system(size: 16, weight: .medium))
-                                    .foregroundColor(isAnnounced ? .green : LASKDesignSystem.Colors.textSecondary)
-                                Text("0")
+                                    .foregroundColor(userAnnounced ? .green : LASKDesignSystem.Colors.textSecondary)
+                                Text("\(broadcastCount)")
                                     .font(.system(size: 10, weight: .medium))
-                                    .foregroundColor(isAnnounced ? .green : LASKDesignSystem.Colors.text)
+                                    .foregroundColor(userAnnounced ? .green : LASKDesignSystem.Colors.text)
                             }
                         }
                         .buttonStyle(PlainButtonStyle())
@@ -739,17 +992,17 @@ struct ModernPostCard: View {
 
                         // Fire (like)
                         Button(action: {
-                            isLiked.toggle()
-                            likesCount += isLiked ? 1 : -1
-                            Task { await LASKOService().likePost(post) }
+                            guard !userLiked else { return }
+                            likesCount += 1
+                            Task { await laskoService.likePost(post) }
                         }) {
                             HStack(spacing: 4) {
-                                Image(systemName: isLiked ? "flame.fill" : "flame")
+                                Image(systemName: userLiked ? "flame.fill" : "flame")
                                     .font(.system(size: 16, weight: .medium))
-                                    .foregroundColor(isLiked ? .red : LASKDesignSystem.Colors.textSecondary)
+                                    .foregroundColor(userLiked ? .red : LASKDesignSystem.Colors.textSecondary)
                                 Text("\(likesCount)")
                                     .font(.system(size: 10, weight: .medium))
-                                    .foregroundColor(isLiked ? .red : LASKDesignSystem.Colors.text)
+                                    .foregroundColor(userLiked ? .red : LASKDesignSystem.Colors.text)
                             }
                         }
                         .buttonStyle(PlainButtonStyle())
@@ -761,36 +1014,19 @@ struct ModernPostCard: View {
                         
                         Spacer()
 
-                        // Three dots button
-                        Button(action: {
-                            UIPasteboard.general.string = post.id
-                            // Add haptic feedback
-                            let impactFeedback = UIImpactFeedbackGenerator(style: .light)
-                            impactFeedback.impactOccurred()
-                            // Change color to orange for this post
-                            selectedPostID = post.id
-                        }) {
-                            HStack(spacing: 4) {
-                                Image(systemName: "ellipsis")
-                                    .font(.system(size: 16, weight: .medium))
-                                    .foregroundColor(selectedPostID == post.id ? .orange : LASKDesignSystem.Colors.textSecondary)
-                                Text("")
-                                    .font(.system(size: 10, weight: .medium))
-                                    .foregroundColor(.clear)
-                            }
-                        }
-                        .buttonStyle(PlainButtonStyle())
+                        PostOptionsMenu(post: post, laskoService: laskoService)
                     }
                 
                     // Inline replies section
                     if showReplies {
                         VStack(alignment: .leading, spacing: 8) {
                             if let replies = laskoService.repliesByCode[post.id], !replies.isEmpty {
-                                let topReplies = getTopThreeComments(from: replies)
+                                let topLevelReplies = replies.filter { ($0.parentCode ?? "").isEmpty || $0.parentCode == post.id }
+                                let topReplies = getTopThreeComments(from: topLevelReplies)
                                 ForEach(topReplies) { r in
                                     VStack(alignment: .leading, spacing: 4) {
                                         HStack {
-                                            Text(laskoService.getDisplayName(for: r.author))
+                                            Text(r.author)
                                                 .font(.system(size: 12, weight: .semibold))
                                                 .foregroundColor(LASKDesignSystem.Colors.text)
                                             Spacer()
@@ -808,12 +1044,15 @@ struct ModernPostCard: View {
                                 }
                                 
                                 // Show "Show more" if there are more than 3 comments
-                                if replies.count > 3 {
-                                    Text("Show more")
-                                        .font(.system(size: 12, weight: .medium))
-                                        .foregroundColor(.orange)
-                                        .padding(.top, 4)
-                                        .padding(.leading, 10)
+                                if replies.count > 3 || replies.contains(where: { !($0.parentCode ?? "").isEmpty && $0.parentCode != post.id }) {
+                                    Button(action: onTap) {
+                                        Text("Open full thread")
+                                            .font(.system(size: 12, weight: .medium))
+                                            .foregroundColor(.orange)
+                                            .padding(.top, 4)
+                                            .padding(.leading, 10)
+                                    }
+                                    .buttonStyle(PlainButtonStyle())
                                 }
                             } else {
                                 Text("No replies yet.")
@@ -824,23 +1063,36 @@ struct ModernPostCard: View {
                             HStack(spacing: 8) {
                                 TextField("Write a reply…", text: $inlineReplyText)
                                     .textFieldStyle(.roundedBorder)
-                                Button("Reply") {
+                                    .disabled(isSubmittingInlineReply || laskoService.isReviewingContent)
+                                Button(inlineReplyButtonTitle) {
                                     let text = inlineReplyText.trimmingCharacters(in: .whitespacesAndNewlines)
                                     guard !text.isEmpty else { return }
                                     Task {
-                                        let ok = await laskoService.createComment(content: text, parentSequentialCode: post.id)
+                                        isSubmittingInlineReply = true
+                                        defer { isSubmittingInlineReply = false }
+                                        let ok = await laskoService.createComment(
+                                            content: text,
+                                            parentSequentialCode: post.id,
+                                            threadRootCode: post.id
+                                        )
                                         if ok {
                                             inlineReplyText = ""
+                                            laskoService.errorMessage = nil
                                             await laskoService.fetchComments(forSequentialCode: post.id)
+                                        } else {
+                                            showInlineReplyErrorAlert = true
                                         }
                                     }
                                 }
-                                .disabled(inlineReplyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                                .disabled(
+                                    isSubmittingInlineReply
+                                    || laskoService.isReviewingContent
+                                    || inlineReplyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                )
                             }
                             .padding(.top, 4)
                         }
                     }
-                }
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 16)
@@ -849,26 +1101,51 @@ struct ModernPostCard: View {
                     .fill(Color.white.opacity(0.05))
             )
             .onAppear {
-                // Initialize local state from the incoming post
-                isLiked = post.isLiked
                 likesCount = post.likes
-                // Prefetch comments to ensure feed shows aggregated count when available
+                broadcastCount = post.broadcastCount
                 if laskoService.repliesByCode[post.id] == nil && post.replies > 0 {
                     Task { await laskoService.fetchComments(forSequentialCode: post.id) }
                 }
             }
+            .onChange(of: post.likes, initial: false) { _, newValue in
+                likesCount = newValue
+            }
+            .onChange(of: post.broadcastCount, initial: false) { _, newValue in
+                broadcastCount = newValue
+            }
+            .onChange(of: laskoService.userActionStateVersion, initial: false) { _, _ in
+                if let updated = laskoService.posts.first(where: { $0.feedKey == post.feedKey }) {
+                    likesCount = updated.likes
+                    broadcastCount = updated.broadcastCount
+                }
+            }
         }
-        .buttonStyle(PlainButtonStyle())
         .background(
-            Rectangle()
-                .fill(LASKDesignSystem.Colors.cardBackground.opacity(0.1))
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(LASKDesignSystem.Colors.postSurface)
         )
         .overlay(
-            Rectangle()
-                .frame(height: 1)
-                .foregroundColor(LASKDesignSystem.Colors.divider),
-            alignment: .bottom
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .stroke(LASKDesignSystem.Colors.primary.opacity(0.8), lineWidth: 1)
         )
+        .padding(.horizontal, 14)
+        .padding(.vertical, 4)
+        .overlay {
+            if isSubmittingInlineReply && laskoService.isReviewingContent {
+                ModerationReviewingOverlay()
+            }
+        }
+        .alert("Unable to post", isPresented: $showInlineReplyErrorAlert) {
+            Button("OK", role: .cancel) { laskoService.errorMessage = nil }
+        } message: {
+            Text(laskoService.errorMessage ?? "Failed to post reply")
+        }
+    }
+    
+    private var inlineReplyButtonTitle: String {
+        if laskoService.isReviewingContent && isSubmittingInlineReply { return "Reviewing…" }
+        if isSubmittingInlineReply { return "Posting…" }
+        return "Reply"
     }
     
     private func timeAgoString(from date: Date) -> String {
@@ -912,15 +1189,15 @@ struct TelestaiRewardActionButton: View {
                 guard !isRewarding else { return }
                 
                 isRewarding = true
-                withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
-                    showReward = true
-                }
-                isActive = true
                 
                 // Reward the post
                 Task {
                     let success = await laskoService.rewardPost(post, amount: 10.0)
                     if success {
+                        withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+                            showReward = true
+                        }
+                        isActive = true
                         // Haptic feedback
                         let impactFeedback = UIImpactFeedbackGenerator(style: .medium)
                         impactFeedback.impactOccurred()
@@ -984,6 +1261,10 @@ struct ModernProfileView: View {
     @State private var bio = "Building the future of decentralized social media on LASKO"
     @State private var tlsAddress = ""
     @State private var scrollOffset: CGFloat = 0
+    @State private var profilePosts: [Post] = []
+    @State private var didLoadProfilePosts = false
+    @State private var socialStatus: LASKOSocialStatus?
+    @State private var followBusy = false
     
     init(viewingAddress: String? = nil) {
         self.viewingAddress = viewingAddress
@@ -1003,12 +1284,26 @@ struct ModernProfileView: View {
         return laskoService.currentTLSAddress ?? (tlsAddress.isEmpty ? "" : tlsAddress)
     }
     
-    // Remove mock posts; profile should reflect only the current user's real posts
+    // Profile shows the user's own posts plus posts they announced.
+    // Prefer the dedicated backend fetch; fall back to the in-memory feed until it loads.
     private var userPosts: [Post] {
         let addr = resolvedAddress
         guard !addr.isEmpty else { return [] }
+        if !profilePosts.isEmpty { return profilePosts }
+        // Fallback: an announce repost carries the ORIGINAL author's tlsAddress but announcedBy == addr,
+        // so match on either to include both "posts made" and "posts announced".
         return laskoService.posts.filter { p in
-            return p.tlsAddress == addr
+            p.tlsAddress == addr || p.announcedBy == addr
+        }
+    }
+
+    private func loadProfilePosts() async {
+        let addr = resolvedAddress
+        guard !addr.isEmpty else { return }
+        let fetched = await laskoService.fetchUserFeed(address: addr)
+        await MainActor.run {
+            self.profilePosts = fetched
+            self.didLoadProfilePosts = true
         }
     }
     
@@ -1054,6 +1349,15 @@ struct ModernProfileView: View {
                                         .aspectRatio(contentMode: .fill)
                                         .frame(width: 60, height: 60)
                                         .clipShape(Circle())
+                                        .overlay(
+                                            Circle()
+                                                .strokeBorder(
+                                                    (!isViewingOwnProfile && (socialStatus?.isFollowing == true || laskoService.isFollowing(resolvedAddress)))
+                                                    ? Color.green
+                                                    : Color.clear,
+                                                    lineWidth: 2.5
+                                                )
+                                        )
                                         .shadow(color: Color(red: 1.0, green: 0.6, blue: 0.0).opacity(0.3), radius: 8, x: 0, y: 4)
                                 } else {
                                     Circle()
@@ -1068,6 +1372,15 @@ struct ModernProfileView: View {
                                             )
                                         )
                                         .frame(width: 60, height: 60)
+                                        .overlay(
+                                            Circle()
+                                                .strokeBorder(
+                                                    (!isViewingOwnProfile && (socialStatus?.isFollowing == true || laskoService.isFollowing(resolvedAddress)))
+                                                    ? Color.green
+                                                    : Color.clear,
+                                                    lineWidth: 2.5
+                                                )
+                                        )
                                         .shadow(color: Color(red: 1.0, green: 0.6, blue: 0.0).opacity(0.3), radius: 8, x: 0, y: 4)
                                     
                                     Text("U")
@@ -1173,7 +1486,7 @@ struct ModernProfileView: View {
                             }
                             
                             HStack(spacing: 4) {
-                                Text("0")
+                                Text("\(socialStatus?.followingCount ?? 0)")
                                     .font(.system(size: 14, weight: .bold))
                                     .foregroundColor(LASKDesignSystem.Colors.text)
                                 Text("Following")
@@ -1182,12 +1495,46 @@ struct ModernProfileView: View {
                             }
                             
                             HStack(spacing: 4) {
-                                Text("0")
+                                Text("\(socialStatus?.followerCount ?? 0)")
                                     .font(.system(size: 14, weight: .bold))
                                     .foregroundColor(LASKDesignSystem.Colors.text)
                                 Text("Followers")
                                     .font(.system(size: 12, weight: .medium))
                                     .foregroundColor(LASKDesignSystem.Colors.textSecondary)
+                            }
+
+                            Spacer(minLength: 0)
+
+                            if !isViewingOwnProfile, laskoService.isAuthenticatedWithZeroa {
+                                let isFollowing = socialStatus?.isFollowing == true || laskoService.isFollowing(resolvedAddress)
+                                Button {
+                                    Task {
+                                        followBusy = true
+                                        let addr = resolvedAddress
+                                        let ok: Bool
+                                        if isFollowing {
+                                            ok = await laskoService.unfollow(address: addr)
+                                        } else {
+                                            ok = await laskoService.follow(address: addr)
+                                        }
+                                        if ok, let refreshed = await laskoService.fetchSocialStatus(for: addr) {
+                                            socialStatus = refreshed
+                                        }
+                                        followBusy = false
+                                    }
+                                } label: {
+                                    if isFollowing {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .font(.system(size: 22, weight: .semibold))
+                                            .foregroundColor(.green)
+                                    } else {
+                                        Text("+ Follow")
+                                            .font(.system(size: 14, weight: .semibold))
+                                            .foregroundColor(Color(red: 1.0, green: 0.6, blue: 0.0))
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(followBusy || resolvedAddress.isEmpty)
                             }
                         }
                         .padding(.horizontal, 20)
@@ -1209,7 +1556,7 @@ struct ModernProfileView: View {
                             
                             // User's posts only
                             LazyVStack(spacing: 0) {
-                                ForEach(userPosts, id: \.id) { post in
+                                ForEach(userPosts, id: \.feedKey) { post in
                                     ModernPostCard(post: post, onProfileTap: {
                                         // Profile tap handled by navigation
                                     }) {
@@ -1253,9 +1600,9 @@ struct ModernProfileView: View {
             // Only load current user's profile data when viewing own profile
             if isViewingOwnProfile {
                 if profileImage == nil {
-                    profileImage = AppGroupsService.shared.getProfileImage()
+                    profileImage = AppGroupsService.shared.getProfileImage(for: resolvedAddress)
                 }
-                if let syncedName = AppGroupsService.shared.getProfileDisplayName(), !syncedName.isEmpty {
+                if let syncedName = AppGroupsService.shared.getProfileDisplayName(for: resolvedAddress), !syncedName.isEmpty {
                     laskoService.username = syncedName
                 }
                 if tlsAddress.isEmpty {
@@ -1268,11 +1615,20 @@ struct ModernProfileView: View {
                 }
             }
         }
+        .task(id: resolvedAddress) {
+            profileImage = isViewingOwnProfile
+                ? AppGroupsService.shared.getProfileImage(for: resolvedAddress)
+                : nil
+            await loadProfilePosts()
+            if !resolvedAddress.isEmpty {
+                socialStatus = await laskoService.fetchSocialStatus(for: resolvedAddress)
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
             // Only update profile data when viewing own profile
             if isViewingOwnProfile {
-                profileImage = AppGroupsService.shared.getProfileImage()
-                if let syncedName = AppGroupsService.shared.getProfileDisplayName(), !syncedName.isEmpty {
+                profileImage = AppGroupsService.shared.getProfileImage(for: resolvedAddress)
+                if let syncedName = AppGroupsService.shared.getProfileDisplayName(for: resolvedAddress), !syncedName.isEmpty {
                     laskoService.username = syncedName
                 }
             }
@@ -1570,7 +1926,10 @@ struct LASKOSideMenuView: View {
 
                 Group {
                     sideRow(title: "Storage", systemImage: "externaldrive.fill", action: openFluxDrive)
-                    sideRow(title: "Subscription", systemImage: "lock.shield", action: openSubscription)
+                    // Subscription menu item ghosted out (posting is now free)
+                    sideRow(title: "Subscription", systemImage: "lock.shield", action: {})
+                        .opacity(0.3)
+                        .disabled(true)
                     sideRow(title: "Settings", systemImage: "gearshape.fill", action: openSettings)
                     sideRow(title: "Support & Help", systemImage: "questionmark.circle.fill", action: openSupport)
                     sideRow(title: "Theme: \(themeManager.currentTheme)", systemImage: "paintbrush.fill", action: {

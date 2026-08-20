@@ -11,7 +11,7 @@ final class HaloService: ObservableObject {
     private let wallet = WalletService.shared
     private let appGroups = AppGroupsService.shared
 
-    func ensureToken(bundleId: String = "com.telestai.Zeroa") async {
+    func ensureToken(bundleId: String = "com.tls.Zeroa") async {
         let profileActive = appGroups.isProfileActive()
         guard profileActive else {
             print("❌ HaloService: Account marked inactive")

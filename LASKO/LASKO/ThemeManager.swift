@@ -42,11 +42,33 @@ struct LASKDesignSystem {
         static var background: Color {
             switch LASKThemeManager.shared.currentTheme {
             case "Light":
-                return Color(hex: "#f8f9fa") // Light gray background
+                return Color(hex: "#eef0f3") // Soft gray so white cards stand out
             case "Dark":
-                return Color(red: 0.15, green: 0.15, blue: 0.15) // Current charcoal
+                return Color(hex: "#181818")
             default:
-                return Color(red: 0.15, green: 0.15, blue: 0.15)
+                return Color(hex: "#181818")
+            }
+        }
+        
+        static var postSurface: Color {
+            switch LASKThemeManager.shared.currentTheme {
+            case "Light":
+                return Color.white
+            case "Dark":
+                return Color(hex: "#252525")
+            default:
+                return Color(hex: "#252525")
+            }
+        }
+        
+        static var nestedPostSurface: Color {
+            switch LASKThemeManager.shared.currentTheme {
+            case "Light":
+                return Color(hex: "#f7f8fa")
+            case "Dark":
+                return Color(hex: "#2E2E2E")
+            default:
+                return Color(hex: "#2E2E2E")
             }
         }
         
@@ -55,9 +77,9 @@ struct LASKDesignSystem {
             case "Light":
                 return Color.white
             case "Dark":
-                return Color(hex: "#1a1a1a") // Darker charcoal for cards
+                return Color(hex: "#202020")
             default:
-                return Color(hex: "#1a1a1a")
+                return Color(hex: "#202020")
             }
         }
         
@@ -66,9 +88,9 @@ struct LASKDesignSystem {
             case "Light":
                 return Color.black
             case "Dark":
-                return Color.white
+                return Color(hex: "#F2F2F2")
             default:
-                return Color.white
+                return Color(hex: "#F2F2F2")
             }
         }
         
@@ -77,9 +99,9 @@ struct LASKDesignSystem {
             case "Light":
                 return Color.black.opacity(0.7)
             case "Dark":
-                return Color.white.opacity(0.7)
+                return Color(hex: "#A8A8A8")
             default:
-                return Color.white.opacity(0.7)
+                return Color(hex: "#A8A8A8")
             }
         }
         
@@ -104,9 +126,9 @@ struct LASKDesignSystem {
             case "Light":
                 return Color.black.opacity(0.1)
             case "Dark":
-                return Color.white.opacity(0.1)
+                return Color(hex: "#3A3A3A")
             default:
-                return Color.white.opacity(0.1)
+                return Color(hex: "#3A3A3A")
             }
         }
         
@@ -115,9 +137,9 @@ struct LASKDesignSystem {
             case "Light":
                 return Color.black.opacity(0.1)
             case "Dark":
-                return Color.orange.opacity(0.6) // Current orange divider
+                return Color(hex: "#3A3A3A")
             default:
-                return Color.orange.opacity(0.6)
+                return Color(hex: "#3A3A3A")
             }
         }
         

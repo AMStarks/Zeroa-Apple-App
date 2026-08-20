@@ -3,7 +3,7 @@ import SwiftUI
 struct ModernPostComposerView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    @StateObject private var laskoService = LASKOService.shared
+    @EnvironmentObject private var laskoService: LASKOService
     @State private var content = "" // legacy
     @State private var author = "User"
     @State private var selectedImages: [UIImage] = []
@@ -16,6 +16,7 @@ struct ModernPostComposerView: View {
     @State private var pollDurationHours: Int = 24
     @State private var scheduledDate: Date? = nil
     @State private var selectedGIFs: [URL] = []
+    @State private var showSubscriptionSheet = false
 
     @StateObject private var richController = RichTextController()
     @State private var attributedText: NSAttributedString = NSAttributedString(string: "")
@@ -45,8 +46,11 @@ struct ModernPostComposerView: View {
                             Task {
                                 let plain = attributedText.string
                                 if plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false && plain.count <= 1000 {
-                                    _ = await laskoService.createPost(content: plain)
-                                    dismiss()
+                                    let success = await laskoService.createPost(content: plain)
+                                    if success {
+                                        dismiss()
+                                    }
+                                    // Subscription error handling removed - posting is now free
                                 }
                             }
                         }
@@ -68,7 +72,7 @@ struct ModernPostComposerView: View {
                         // Avatar positioned at top left
                         HStack(alignment: .top, spacing: 0) {
                             ZStack {
-                                if let profileImage = AppGroupsService.shared.getProfileImage() {
+                                if let profileImage = AppGroupsService.shared.getProfileImage(for: laskoService.currentTLSAddress) {
                                     Image(uiImage: profileImage)
                                         .resizable()
                                         .scaledToFill()
@@ -180,6 +184,46 @@ struct ModernPostComposerView: View {
         .onChange(of: pickerImage, initial: false) { oldValue, img in if let img = img { selectedImages.append(img) } }
         .sheet(isPresented: $showPollMaker) { PollMakerSheet(options: $pollOptions, durationHours: $pollDurationHours) }
         .sheet(isPresented: $showScheduler) { SchedulerSheet(scheduledDate: $scheduledDate) }
+        .sheet(isPresented: $showSubscriptionSheet) { SubscriptionSheetView() }
+        .overlay {
+            if laskoService.isReviewingContent {
+                ModerationReviewingOverlay()
+            }
+        }
+        .alert("Reissue posting signature", isPresented: Binding(
+            get: {
+                laskoService.errorMessage != nil
+                    && !laskoService.isReviewingContent
+                    && laskoService.needsOpenZeroaToSign
+            },
+            set: { if !$0 {
+                laskoService.errorMessage = nil
+                laskoService.needsOpenZeroaToSign = false
+            } }
+        )) {
+            Button("Open Zeroa") {
+                laskoService.openZeroaToFinishSigning()
+                laskoService.errorMessage = nil
+            }
+            Button("Cancel", role: .cancel) {
+                laskoService.errorMessage = nil
+                laskoService.needsOpenZeroaToSign = false
+            }
+        } message: {
+            Text(laskoService.errorMessage ?? "Your posting signature expired. Tap Open Zeroa to reissue for another hour.")
+        }
+        .alert("Unable to post", isPresented: Binding(
+            get: {
+                laskoService.errorMessage != nil
+                    && !laskoService.isReviewingContent
+                    && !laskoService.needsOpenZeroaToSign
+            },
+            set: { if !$0 { laskoService.errorMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) { laskoService.errorMessage = nil }
+        } message: {
+            Text(laskoService.errorMessage ?? "")
+        }
     }
 
     private var plainDisabled: Bool { attributedText.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || attributedText.string.count > 1000 }

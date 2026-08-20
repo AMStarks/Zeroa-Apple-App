@@ -5,7 +5,7 @@ class AppGroupsService {
     static let shared = AppGroupsService()
     
     // App Group identifier - both apps will use this
-    private let appGroupIdentifier = "group.com.telestai.zeroa-lasko"
+    private let appGroupIdentifier = "group.com.tls.zeroa-lasko"
     private let profileAccountActiveKey = "profile_account_active"
     let sharedDefaults: UserDefaults?
     
@@ -20,17 +20,60 @@ class AppGroupsService {
     }
 
     // MARK: - Profile Sync
-    func getProfileDisplayName() -> String? {
+    private func scopedProfileKey(_ base: String, tlsAddress: String?) -> String {
+        let resolvedTLS = (tlsAddress?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+            ? tlsAddress?.trimmingCharacters(in: .whitespacesAndNewlines)
+            : getTLSAddress()?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let tls = resolvedTLS, !tls.isEmpty else { return base }
+        return "\(base)_\(tls)"
+    }
+
+    func getProfileDisplayName(for tlsAddress: String? = nil) -> String? {
         sharedDefaults?.synchronize()
-        return sharedDefaults?.string(forKey: "profile_display_name")
+        migrateLegacyGlobalsIfNeeded(tlsAddress: tlsAddress)
+        let scopedKey = scopedProfileKey("profile_display_name", tlsAddress: tlsAddress)
+        guard scopedKey != "profile_display_name" else { return nil }
+        if let value = sharedDefaults?.string(forKey: scopedKey), !value.isEmpty {
+            return value
+        }
+        return nil
     }
     
-    func getProfileImage() -> UIImage? {
+    func getProfileImage(for tlsAddress: String? = nil) -> UIImage? {
         sharedDefaults?.synchronize()
-        if let data = sharedDefaults?.data(forKey: "profile_image_data") {
+        migrateLegacyGlobalsIfNeeded(tlsAddress: tlsAddress)
+        let scopedKey = scopedProfileKey("profile_image_data", tlsAddress: tlsAddress)
+        guard scopedKey != "profile_image_data" else { return nil }
+        if let data = sharedDefaults?.data(forKey: scopedKey) {
             return UIImage(data: data)
         }
         return nil
+    }
+
+    /// Copy leftover unscoped name/photo onto this wallet, then drop the shared slot.
+    func migrateLegacyGlobalsIfNeeded(tlsAddress: String? = nil) {
+        let tls = (tlsAddress?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+            ? tlsAddress!.trimmingCharacters(in: .whitespacesAndNewlines)
+            : getTLSAddress()?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let tls, !tls.isEmpty, let defaults = sharedDefaults else { return }
+
+        let scopedNameKey = "profile_display_name_\(tls)"
+        let scopedImageKey = "profile_image_data_\(tls)"
+        if (defaults.string(forKey: scopedNameKey) ?? "").isEmpty,
+           let globalName = defaults.string(forKey: "profile_display_name"),
+           !globalName.isEmpty {
+            defaults.set(globalName, forKey: scopedNameKey)
+        }
+        if defaults.data(forKey: scopedImageKey) == nil,
+           let globalImage = defaults.data(forKey: "profile_image_data") {
+            defaults.set(globalImage, forKey: scopedImageKey)
+        }
+        // Keep globals populated so Zeroa UI (which also reads them) stays in sync.
+        defaults.synchronize()
+    }
+
+    func clearLegacyGlobalProfileKeys() {
+        migrateLegacyGlobalsIfNeeded()
     }
 
     // MARK: - LASKO Authentication Request
@@ -51,6 +94,9 @@ class AppGroupsService {
         if let username = request.username { requestData["username"] = username }
         
         // Write to App Groups (write full dict first, then nonce/timestamp)
+        sharedDefaults?.removeObject(forKey: "lasko_auth_response")
+        sharedDefaults?.removeObject(forKey: "lasko_auth_in_flight_nonce")
+        sharedDefaults?.removeObject(forKey: "lasko_auth_last_processed_nonce")
         sharedDefaults?.set(requestData, forKey: "lasko_auth_request")
         sharedDefaults?.set(nonce, forKey: "lasko_auth_request_nonce")
         sharedDefaults?.set(issuedAt, forKey: "lasko_auth_request_timestamp")
@@ -150,6 +196,10 @@ class AppGroupsService {
                 tlsAddress: tlsAddress,
                 sessionToken: sessionToken,
                 signature: signature,
+                canonicalMessage: responseData["canonicalMessage"] as? String,
+                signatureBase64: responseData["signatureBase64"] as? String,
+                pubkeyCompressedHex: responseData["pubkeyCompressedHex"] as? String,
+                requestNonce: responseData["requestNonce"] as? String,
                 timestamp: timestamp,
                 expiresAt: expiresAt,
                 permissions: permissions
@@ -171,10 +221,14 @@ class AppGroupsService {
     
     func clearAuthRequest() {
         sharedDefaults?.removeObject(forKey: "lasko_auth_request")
+        sharedDefaults?.removeObject(forKey: "lasko_auth_request_nonce")
+        sharedDefaults?.removeObject(forKey: "lasko_auth_request_timestamp")
+        sharedDefaults?.synchronize()
     }
     
     func clearAuthResponse() {
         sharedDefaults?.removeObject(forKey: "lasko_auth_response")
+        sharedDefaults?.synchronize()
     }
     
     func clearAll() {

@@ -12,16 +12,45 @@ struct Post: Identifiable, Codable {
     let avatarURL: String?
     let parentCode: String?
     let tlsAddress: String? // Store the original TLS address for filtering
+    let profileName: String? // Zeroa display name from API / post body
     let broadcastCount: Int // For comment ranking (2 points each)
     let tlsCount: Int // For comment ranking (3 points each)
     let followerCount: Int // For comment ranking priority (second tier)
+    /// Unique key for feed rows (announce reposts share `id` with the original post).
+    let feedKey: String
+    let announcedBy: String?
+    let announcedByProfileName: String?
+    let announcedAt: Date?
+    
+    var isAnnounceRepost: Bool { announcedBy != nil }
+    var isReply: Bool { !(parentCode?.isEmpty ?? true) }
     
     // Computed property for comment ranking points
     var points: Int {
         return likes + (broadcastCount * 2) + (tlsCount * 3)
     }
     
-    init(id: String = UUID().uuidString, content: String, author: String, timestamp: Date = Date(), likes: Int = 0, replies: Int = 0, isLiked: Bool = false, userRank: String = "Bronze", avatarURL: String? = nil, parentCode: String? = nil, tlsAddress: String? = nil, broadcastCount: Int = 0, tlsCount: Int = 0, followerCount: Int = 0) {
+    init(
+        id: String = UUID().uuidString,
+        content: String,
+        author: String,
+        timestamp: Date = Date(),
+        likes: Int = 0,
+        replies: Int = 0,
+        isLiked: Bool = false,
+        userRank: String = "Bronze",
+        avatarURL: String? = nil,
+        parentCode: String? = nil,
+        tlsAddress: String? = nil,
+        profileName: String? = nil,
+        broadcastCount: Int = 0,
+        tlsCount: Int = 0,
+        followerCount: Int = 0,
+        feedKey: String? = nil,
+        announcedBy: String? = nil,
+        announcedByProfileName: String? = nil,
+        announcedAt: Date? = nil
+    ) {
         self.id = id
         self.content = content
         self.author = author
@@ -33,9 +62,14 @@ struct Post: Identifiable, Codable {
         self.avatarURL = avatarURL
         self.parentCode = parentCode
         self.tlsAddress = tlsAddress
+        self.profileName = profileName
         self.broadcastCount = broadcastCount
         self.tlsCount = tlsCount
         self.followerCount = followerCount
+        self.feedKey = feedKey ?? id
+        self.announcedBy = announcedBy
+        self.announcedByProfileName = announcedByProfileName
+        self.announcedAt = announcedAt
     }
 }
 
@@ -48,4 +82,4 @@ extension Post {
         Post(content: "Testing the LASKO platform. So far, so good! The UI is clean and the experience is smooth.", author: "early_adopter", likes: 15, replies: 2, userRank: "Silver", broadcastCount: 0, tlsCount: 0, followerCount: 45),
         Post(content: "Blockchain-powered social media is the way forward. LASKO is leading the charge.", author: "blockchain_expert", likes: 89, replies: 8, userRank: "Bronze", broadcastCount: 2, tlsCount: 1, followerCount: 67)
     ]
-} 
+}
