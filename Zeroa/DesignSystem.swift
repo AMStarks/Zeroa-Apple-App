@@ -137,6 +137,8 @@ struct DesignSystem {
         static let error = Color.red
         static let success = Color.green
         static let warning = Color.orange
+        /// Text/icons on filled primary or solid buttons (e.g. Apple sign-in).
+        static let onPrimary = Color.white
         
         static var border: Color {
             switch ThemeManager.shared.currentTheme {

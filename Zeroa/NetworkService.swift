@@ -34,8 +34,10 @@ class NetworkService {
     }
 
     func getGrokResponse(input: String, completion: @escaping (Result<String, Error>) -> Void) {
+#if DEBUG
         print("🌐 Making API request to: \(apiUrl)")
         print("📝 Input: \(input)")
+#endif
         
         // Check if API key is available
         guard !apiKey.isEmpty else {
@@ -62,7 +64,9 @@ class NetworkService {
             "temperature": 0.7
         ]
         
+#if DEBUG
         print("🔑 Authorization header: Bearer \(String(apiKey.prefix(10)))...")
+#endif
         
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         
@@ -74,15 +78,19 @@ class NetworkService {
             }
             
             if let httpResponse = response as? HTTPURLResponse {
+#if DEBUG
                 print("📡 HTTP Status Code: \(httpResponse.statusCode)")
                 print("📡 HTTP Headers: \(httpResponse.allHeaderFields)")
+#endif
             }
             
             if let data = data {
+#if DEBUG
                 print("📦 Response data length: \(data.count) bytes")
                 if let responseString = String(data: data, encoding: .utf8) {
                     print("📦 Response body: \(responseString)")
                 }
+#endif
             }
             
             guard let data = data else {
@@ -104,15 +112,19 @@ class NetworkService {
                   let message = choices.first?["message"] as? [String: Any],
                   let content = message["content"] as? String else {
                 print("❌ Failed to parse response JSON")
+#if DEBUG
                 if let responseString = String(data: data, encoding: .utf8) {
                     print("📦 Raw response: \(responseString)")
                 }
+#endif
                 completion(.failure(NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid response format"])))
                 return
             }
             
             print("✅ Successfully parsed response")
+#if DEBUG
             print("📄 Content: \(content)")
+#endif
             completion(.success(content))
         }.resume()
     }

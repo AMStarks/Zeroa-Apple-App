@@ -9,42 +9,73 @@ final class HaloService: ObservableObject {
 
     private let api = HaloAPIService.shared
     private let wallet = WalletService.shared
+    private let appGroups = AppGroupsService.shared
 
-    func ensureToken(bundleId: String = "com.telestai.Zeroa") async {
-        guard let address = wallet.loadAddress() else { print("❌ HaloService: No TLS address loaded, abort ensureToken"); return }
-        let now = Int64(Date().timeIntervalSince1970)
-        if let (tok, exp) = api.storedToken(), exp - now > 60 {
-            self.isAuthenticated = true
-            self.tokenExp = exp
-            print("🔐 HaloService: Using stored token exp=\(exp)")
+    func ensureToken(bundleId: String = "com.tls.Zeroa") async {
+        let profileActive = appGroups.isProfileActive()
+        guard profileActive else {
+            print("❌ HaloService: Account marked inactive")
             return
         }
+        
+        guard let address = wallet.loadAddress() else {
+            print("❌ HaloService: No TLS address loaded")
+            return
+        }
+        
+        let now = Int64(Date().timeIntervalSince1970)
+        if let (_, exp) = api.storedToken() {
+            let timeUntilExp = exp - now
+            if timeUntilExp > 60 {
+                self.isAuthenticated = true
+                self.tokenExp = exp
+                return
+            }
+        }
+        
         do {
-            print("🔎 HaloService: Requesting challenge for address=\(address) bundleId=\(bundleId)")
             let challenge = try await api.requestChallenge(address: address, bundleId: bundleId)
-            print("🧩 HaloService: Received challenge nonce=\(challenge.nonce) ttl=\(challenge.ttlSeconds)s")
             // Build canonical per server: LASKO|<nonce>|<ttlSeconds>|<bundleId>
             let canonical = "LASKO|\(challenge.nonce)|\(challenge.ttlSeconds)|\(bundleId)"
-            // Sign canonical using secp256k1 and return Base64-encoded r||s
+            
             guard let signature = CryptoService.shared.signMessageBase64(canonical, keychain: wallet.keychain) else {
+                print("❌ HaloService: Failed to create signature")
                 throw URLError(.cannotCreateFile)
             }
+            
             let pubHex = CryptoService.shared.getCompressedPublicKeyHex(keychain: wallet.keychain) ?? ""
-            print("✍️ HaloService: Verifying signature (len=\(signature.count)) for canonical…")
+            
             let verified = try await api.verify(address: address, bundleId: bundleId, nonce: challenge.nonce, signature: signature, pubkeyCompressedHex: pubHex)
             let expSeconds: Int64 = {
                 if let e = verified.exp { return e }
                 if let secs = verified.expiresIn { return Int64(Date().timeIntervalSince1970) + Int64(secs) }
                 return Int64(Date().timeIntervalSince1970) + 600
             }()
+            
             api.storeToken(verified.token, exp: expSeconds)
             self.isAuthenticated = true
             self.tokenExp = expSeconds
-            print("✅ HaloService: Token stored exp=\(verified.exp)")
         } catch {
             self.isAuthenticated = false
-            print("❌ Halo auth failed: \(error)")
+            self.tokenExp = 0
+            print("❌ HaloService: Token ensure failed - \(error.localizedDescription)")
         }
+    }
+    
+    func handleAccountActiveChange(_ isActive: Bool) async {
+        appGroups.setProfileActive(isActive)
+        if isActive {
+            await ensureToken()
+        } else {
+            api.clearToken()
+            isAuthenticated = false
+            tokenExp = 0
+        }
+        NotificationCenter.default.post(
+            name: .zeroaAccountActivationChanged,
+            object: nil,
+            userInfo: ["isActive": isActive]
+        )
     }
 }
 

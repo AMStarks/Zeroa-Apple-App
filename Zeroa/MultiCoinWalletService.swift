@@ -14,6 +14,8 @@ class MultiCoinWalletService: ObservableObject {
     
     private var coinServices: [CoinType: any CoinServiceProtocol] = [:]
     private var cancellables = Set<AnyCancellable>()
+    private var balanceCache: [CoinType: WalletBalance] = [:]
+    private let balanceCacheTTL: TimeInterval = 15
     
     private init() {
         setupCoinServices()
@@ -119,18 +121,58 @@ class MultiCoinWalletService: ObservableObject {
     // MARK: - Balance Management
     func refreshBalances(for wallet: MultiCoinWallet, completion: @escaping ([WalletBalance]) -> Void) {
         Task {
-            var balances: [WalletBalance] = []
+            let entries = wallet.addresses.compactMap { (key, value) -> (CoinType, String)? in
+                guard let coinType = CoinType(rawValue: key),
+                      coinServices[coinType] != nil else { return nil }
+                return (coinType, value)
+            }
             
-            for (coinType, address) in wallet.addresses {
-                if let coinType = CoinType(rawValue: coinType),
-                   let service = coinServices[coinType] {
-                    let balance = await service.getBalance(address: address)
-                    balances.append(balance)
+            guard !entries.isEmpty else {
+                await MainActor.run { completion([]) }
+                return
+            }
+            
+            let now = Date()
+            let cachedBalances = entries.compactMap { (coinType, _) -> WalletBalance? in
+                if let cached = balanceCache[coinType],
+                   now.timeIntervalSince(cached.lastUpdated) < balanceCacheTTL {
+                    return cached
+                }
+                return nil
+            }
+            
+            if !cachedBalances.isEmpty {
+                await MainActor.run {
+                    completion(cachedBalances.sorted { $0.coinType.rawValue < $1.coinType.rawValue })
                 }
             }
             
-            await MainActor.run {
-                completion(balances)
+            var freshBalances: [WalletBalance] = []
+            
+            await withTaskGroup(of: (CoinType, WalletBalance?).self) { group in
+                for (coinType, address) in entries {
+                    let service = coinServices[coinType]
+                    group.addTask {
+                        guard let service = service else { return (coinType, nil) }
+                        let balance = await service.getBalance(address: address)
+                        return (coinType, balance)
+                    }
+                }
+                
+                for await (coinType, balance) in group {
+                    if let balance = balance {
+                        freshBalances.append(balance)
+                        await MainActor.run {
+                            self.balanceCache[coinType] = balance
+                        }
+                    }
+                }
+            }
+            
+            if !freshBalances.isEmpty {
+                await MainActor.run {
+                    completion(freshBalances.sorted { $0.coinType.rawValue < $1.coinType.rawValue })
+                }
             }
         }
     }
@@ -268,16 +310,7 @@ class MultiCoinWalletService: ObservableObject {
     
     // MARK: - Private Methods
     private func setupCoinServices() {
-        // Note: TLSBlockchainService doesn't conform to CoinServiceProtocol, so we'll use BitcoinService as placeholder
-        coinServices[.telestai] = BitcoinService()
-        coinServices[.bitcoin] = BitcoinService()
-        coinServices[.flux] = FluxService()
-        coinServices[.litecoin] = LitecoinService()
-        coinServices[.kaspa] = KaspaService()
-        // Note: USDT and USDC would typically use the same service as Bitcoin since they're ERC-20 tokens
-        // For now, we'll use BitcoinService as a placeholder
-        coinServices[.usdt] = BitcoinService()
-        coinServices[.usdc] = BitcoinService()
+        coinServices[.telestai] = TelestaiCoinServiceAdapter()
     }
     
     private func loadWallets() {

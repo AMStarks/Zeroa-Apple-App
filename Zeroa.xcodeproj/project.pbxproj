@@ -8,12 +8,12 @@
 
 /* Begin PBXBuildFile section */
 		036543CAB4F93C93996DA4B8 /* Pods_ZeroaTests.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 30C81F352212A2AF8DA40681 /* Pods_ZeroaTests.framework */; };
-		778C1213721B3453396C25E0 /* Pods_Zeroa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 046931055CB1555E41B1E172 /* Pods_Zeroa.framework */; };
 		847E3FE62E5D083F00D9A69C /* P256K in Frameworks */ = {isa = PBXBuildFile; productRef = 847E3FE52E5D083F00D9A69C /* P256K */; };
 		84FDE9F52E2674140043C535 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 84FDE9F42E2674140043C535 /* WebKit.framework */; };
 		84FDE9F92E26772E0043C535 /* EventKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 84FDE9F82E26772E0043C535 /* EventKit.framework */; };
 		84FDE9FB2E2677330043C535 /* MapKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 84FDE9FA2E2677330043C535 /* MapKit.framework */; };
 		B082587E3DD11EBB9D265605 /* Pods_ZeroaUITests.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 72845BB10E76813EF800A0B4 /* Pods_ZeroaUITests.framework */; };
+		F0DE8A5855F274A9B00011BC /* Pods_Zeroa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 046931055CB1555E41B1E172 /* Pods_Zeroa.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -92,7 +92,7 @@
 				84FDE9F92E26772E0043C535 /* EventKit.framework in Frameworks */,
 				84FDE9FB2E2677330043C535 /* MapKit.framework in Frameworks */,
 				84FDE9F52E2674140043C535 /* WebKit.framework in Frameworks */,
-
+				F0DE8A5855F274A9B00011BC /* Pods_Zeroa.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -553,8 +553,8 @@
 				CODE_SIGN_ENTITLEMENTS = Zeroa/Zeroa.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 5F2STVK9PF;
+				CURRENT_PROJECT_VERSION = 3;
+				DEVELOPMENT_TEAM = 6G7Y6HSS5H;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Zeroa/Info.plist;
@@ -566,8 +566,8 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.telestai.Zeroa;
+				MARKETING_VERSION = 1.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tls.Zeroa;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -584,8 +584,8 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 5F2STVK9PF;
+				CURRENT_PROJECT_VERSION = 3;
+				DEVELOPMENT_TEAM = 6G7Y6HSS5H;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Zeroa/Info.plist;
@@ -597,8 +597,8 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.telestai.Zeroa;
+				MARKETING_VERSION = 1.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tls.Zeroa;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -613,11 +613,11 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 3;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.telestai.ZeroaTests;
+				MARKETING_VERSION = 1.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tls.ZeroaTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 5.0;
@@ -632,11 +632,11 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 3;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.telestai.ZeroaTests;
+				MARKETING_VERSION = 1.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tls.ZeroaTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 5.0;
@@ -650,10 +650,10 @@
 			baseConfigurationReference = F5C65D645234632914F940DE /* Pods-ZeroaUITests.debug.xcconfig */;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 3;
 				GENERATE_INFOPLIST_FILE = YES;
-				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.telestai.ZeroaUITests;
+				MARKETING_VERSION = 1.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tls.ZeroaUITests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 5.0;
@@ -667,10 +667,10 @@
 			baseConfigurationReference = F8B54004837913EF058AE92B /* Pods-ZeroaUITests.release.xcconfig */;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 3;
 				GENERATE_INFOPLIST_FILE = YES;
-				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.telestai.ZeroaUITests;
+				MARKETING_VERSION = 1.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tls.ZeroaUITests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 5.0;

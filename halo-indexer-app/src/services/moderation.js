@@ -39,11 +39,10 @@ const HARD_BLOCK_REGEX = [
   /(botnet|exploit\s*code|ransomware|keylogger)/i
 ];
 
+// Profanity removed; keep only spam phrases, and defer link heuristic to spam+link combo in charter
 const SOFT_BLOCK_REGEX = [
-  /(damn|shit|fuck|bitch)/i,
   /(buy\s+now|limited\s+offer|click\s+here)/i,
-  /(win\s+money|free\s+crypto|airdrop)/i,
-  /\b(?:https?:\/\/)?[\w.-]+\.[a-z]{2,}\/\S*/i // generic links (spam heuristic)
+  /(win\s+money|free\s+crypto|airdrop)/i
 ];
 
 const PII_REGEX = {
@@ -144,7 +143,20 @@ function evaluateModeration(content, context = {}) {
 }
 
 module.exports = {
-  evaluateModeration
+  evaluateModeration,
+  evaluateMediaModeration: async function(url, type) {
+    const startedAt = Date.now();
+    // Minimal stub: allow all, used by Composer preview
+    return {
+      action: 'allow',
+      categories: [],
+      reason: '',
+      model: 'local-media-stub',
+      charterVersion: CHARTER_VERSION,
+      latencyMs: Date.now() - startedAt,
+      media: { url, type }
+    };
+  }
 };
 
 

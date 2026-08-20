@@ -1,18 +1,24 @@
 import SwiftUI
 import Combine
+import UIKit
 
 // MARK: - Transaction History View
 struct TransactionHistoryView: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var transactionService = MultiCoinTransactionService.shared
-    @State private var selectedCoin: CoinType? = .telestai
+    @StateObject private var tlsService = TLSBlockchainService.shared
+    @State private var selectedCoin: CoinType = .telestai
     @State private var selectedFilter: TransactionFilter = .all
     @State private var searchText = ""
     @State private var showTransactionDetail = false
     @State private var selectedTransaction: WalletTransaction?
     @State private var isLoading = false
     @State private var showCoinPicker = false
-    @State private var availableCoins: [CoinType] = []
+    @State private var availableCoins: [CoinType] = [.telestai]
+    @State private var receiveAddresses: [(index: UInt32, address: String)] = []
+    @State private var changeAddresses: [(index: UInt32, address: String)] = []
+    @State private var showAddressManager = false
+    @AppStorage("zeroa_reuse_primary_change") private var reusePrimaryChange = false
     
     enum TransactionFilter: String, CaseIterable {
         case all = "All"
@@ -58,33 +64,20 @@ struct TransactionHistoryView: View {
                         showCoinPicker = true
                     }) {
                         HStack {
-                            if let selectedCoin = selectedCoin {
-                                Image(selectedCoin.icon)
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fit)
-                                    .frame(width: 24, height: 24)
+                            Image(selectedCoin.icon)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(width: 24, height: 24)
+                            
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(selectedCoin.name)
+                                    .font(DesignSystem.Typography.bodyMedium)
+                                    .fontWeight(.semibold)
+                                    .foregroundColor(DesignSystem.Colors.text)
                                 
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(selectedCoin.name)
-                                        .font(DesignSystem.Typography.bodyMedium)
-                                        .fontWeight(.semibold)
-                                        .foregroundColor(DesignSystem.Colors.text)
-                                    
-                                    Text(selectedCoin.symbol)
-                                        .font(DesignSystem.Typography.bodySmall)
-                                        .foregroundColor(DesignSystem.Colors.textSecondary)
-                                }
-                            } else {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("All Coins")
-                                        .font(DesignSystem.Typography.bodyMedium)
-                                        .fontWeight(.semibold)
-                                        .foregroundColor(DesignSystem.Colors.text)
-                                    
-                                    Text("View all transactions")
-                                        .font(DesignSystem.Typography.bodySmall)
-                                        .foregroundColor(DesignSystem.Colors.textSecondary)
-                                }
+                                Text(selectedCoin.symbol)
+                                    .font(DesignSystem.Typography.bodySmall)
+                                    .foregroundColor(DesignSystem.Colors.textSecondary)
                             }
                             
                             Spacer()
@@ -103,36 +96,81 @@ struct TransactionHistoryView: View {
                     }
                 }
                 
-                // Filter and Search
-                HStack(spacing: DesignSystem.Spacing.md) {
-                    // Filter Picker
-                    Picker("Filter", selection: $selectedFilter) {
+                // Filter chips (SegmentedPicker with icons rendered as literal "...")
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: DesignSystem.Spacing.sm) {
                         ForEach(TransactionFilter.allCases, id: \.self) { filter in
-                            HStack {
-                                Image(systemName: filter.icon)
-                                Text(filter.rawValue)
+                            Button {
+                                selectedFilter = filter
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: filter.icon)
+                                        .font(.system(size: 12, weight: .semibold))
+                                    Text(filter.rawValue)
+                                        .font(DesignSystem.Typography.bodySmall)
+                                        .fontWeight(.semibold)
+                                }
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .foregroundColor(selectedFilter == filter ? .white : DesignSystem.Colors.text)
+                                .background(
+                                    Capsule()
+                                        .fill(selectedFilter == filter ? DesignSystem.Colors.primary : DesignSystem.Colors.surface)
+                                )
+                                .overlay(
+                                    Capsule()
+                                        .stroke(DesignSystem.Colors.border.opacity(selectedFilter == filter ? 0 : 1), lineWidth: 1)
+                                )
                             }
-                            .tag(filter)
+                            .buttonStyle(PlainButtonStyle())
                         }
                     }
-                    .pickerStyle(SegmentedPickerStyle())
+                }
+                
+                // Search
+                HStack {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundColor(DesignSystem.Colors.textSecondary)
                     
-                    // Search
-                    HStack {
-                        Image(systemName: "magnifyingglass")
-                            .foregroundColor(DesignSystem.Colors.textSecondary)
-                        
-                        TextField("Search transactions", text: $searchText)
-                            .textFieldStyle(PlainTextFieldStyle())
+                    TextField("Search transactions", text: $searchText)
+                        .textFieldStyle(PlainTextFieldStyle())
+                }
+                .padding(.horizontal, DesignSystem.Spacing.md)
+                .padding(.vertical, DesignSystem.Spacing.sm)
+                .background(DesignSystem.Colors.surface)
+                .cornerRadius(DesignSystem.CornerRadius.medium)
+                .overlay(
+                    RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.medium)
+                        .stroke(DesignSystem.Colors.border, lineWidth: 1)
+                )
+                
+                if shouldShowTelestaiExtras {
+                    Button(action: {
+                        showAddressManager = true
+                    }) {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("View Telestai addresses")
+                                    .font(DesignSystem.Typography.bodyMedium)
+                                    .fontWeight(.semibold)
+                                    .foregroundColor(DesignSystem.Colors.text)
+                                Text("See all receive/change paths tied to this wallet")
+                                    .font(DesignSystem.Typography.caption)
+                                    .foregroundColor(DesignSystem.Colors.textSecondary)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundColor(DesignSystem.Colors.textSecondary)
+                        }
+                        .padding(DesignSystem.Spacing.md)
+                        .background(DesignSystem.Colors.surface)
+                        .cornerRadius(DesignSystem.CornerRadius.medium)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.medium)
+                                .stroke(DesignSystem.Colors.border, lineWidth: 1)
+                        )
                     }
-                    .padding(.horizontal, DesignSystem.Spacing.md)
-                    .padding(.vertical, DesignSystem.Spacing.sm)
-                    .background(DesignSystem.Colors.surface)
-                    .cornerRadius(DesignSystem.CornerRadius.medium)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.medium)
-                            .stroke(DesignSystem.Colors.border, lineWidth: 1)
-                    )
                 }
                 
                 // Transaction List
@@ -201,18 +239,35 @@ struct TransactionHistoryView: View {
             }
         }
         .sheet(isPresented: $showCoinPicker) {
-            CoinPickerView(selectedCoin: Binding(
-                get: { selectedCoin ?? .telestai },
-                set: { selectedCoin = $0 }
-            ), availableCoins: availableCoins)
+            CoinPickerView(selectedCoin: $selectedCoin, availableCoins: availableCoins)
         }
         .sheet(isPresented: $showTransactionDetail) {
             if let transaction = selectedTransaction {
                 TransactionDetailView(transaction: transaction)
             }
         }
+        .sheet(isPresented: $showAddressManager) {
+            NavigationView {
+                ScrollView {
+                    telestaiAddressSection
+                        .padding(.horizontal, DesignSystem.Spacing.lg)
+                        .padding(.vertical, DesignSystem.Spacing.md)
+                }
+                .background(DesignSystem.Colors.background)
+                .navigationTitle("Telestai Addresses")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarLeading) {
+                        Button("Close") {
+                            showAddressManager = false
+                        }
+                    }
+                }
+            }
+        }
         .onAppear {
             loadAvailableCoins()
+            loadAddressLists()
             loadTransactions()
         }
         .onChange(of: selectedCoin) { _ in
@@ -225,12 +280,7 @@ struct TransactionHistoryView: View {
     
     // MARK: - Computed Properties
     private var filteredTransactions: [WalletTransaction] {
-        var transactions = transactionService.recentTransactions.values.flatMap { $0 }
-        
-        // Filter by coin
-        if let selectedCoin = selectedCoin {
-            transactions = transactions.filter { $0.coinType == selectedCoin }
-        }
+        var transactions = telestaiWalletTransactions
         
         // Filter by type
         switch selectedFilter {
@@ -257,22 +307,143 @@ struct TransactionHistoryView: View {
         return transactions.sorted { $0.timestamp > $1.timestamp }
     }
     
+    private var shouldShowTelestaiExtras: Bool {
+        selectedCoin == .telestai
+    }
+    
+    private var telestaiWalletTransactions: [WalletTransaction] {
+        tlsService.recentTransactions.map { mapTelestaiTransaction($0) }
+    }
+    
     // MARK: - Helper Methods
     private func loadAvailableCoins() {
-        availableCoins = CoinType.allCases
+        availableCoins = transactionService.supportedCoins
     }
     
     private func loadTransactions() {
-        isLoading = true
+        isLoading = tlsService.recentTransactions.isEmpty
         
         Task {
-            // Simulate loading transactions
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            await tlsService.refreshBalance()
             
             await MainActor.run {
+                loadAddressLists()
                 isLoading = false
             }
         }
+    }
+    
+    private func loadAddressLists() {
+        let manager = AddressManager.shared
+        receiveAddresses = manager.getUsedReceiveAddressInfos()
+        changeAddresses = manager.getUsedChangeAddressInfos()
+    }
+    
+    @ViewBuilder
+    private var telestaiAddressSection: some View {
+        VStack(spacing: DesignSystem.Spacing.md) {
+            CardView {
+                VStack(alignment: .leading, spacing: DesignSystem.Spacing.sm) {
+                    Toggle("Reuse primary address for change outputs", isOn: $reusePrimaryChange)
+                        .toggleStyle(SwitchToggleStyle(tint: DesignSystem.Colors.secondary))
+                    
+                    Text(reusePrimaryChange
+                         ? "Remaining funds will always return to your main wallet address. This is simpler but offers less privacy."
+                         : "Zeroa rotates through change addresses so outgoing transactions stay private. Disable this if you prefer everything sent back to your main address.")
+                        .font(DesignSystem.Typography.caption)
+                        .foregroundColor(DesignSystem.Colors.textSecondary)
+                }
+            }
+            
+            CardView {
+                VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
+                    Text("Active Wallet Addresses")
+                        .font(DesignSystem.Typography.bodyMedium)
+                        .fontWeight(.semibold)
+                        .foregroundColor(DesignSystem.Colors.text)
+                    
+                    Text("Transactions below include every receive and change address derived from your seed (\(receiveAddresses.count + changeAddresses.count) total).")
+                        .font(DesignSystem.Typography.bodySmall)
+                        .foregroundColor(DesignSystem.Colors.textSecondary)
+                    
+                    addressListCard(title: "Receive Addresses", addresses: receiveAddresses)
+                    addressListCard(title: "Change Addresses", addresses: changeAddresses)
+                }
+            }
+        }
+    }
+    
+    @ViewBuilder
+    private func addressListCard(title: String, addresses: [(index: UInt32, address: String)]) -> some View {
+        VStack(alignment: .leading, spacing: DesignSystem.Spacing.sm) {
+            HStack {
+                Text(title)
+                    .font(DesignSystem.Typography.bodyMedium)
+                    .fontWeight(.semibold)
+                    .foregroundColor(DesignSystem.Colors.text)
+                Spacer()
+                Text("\(addresses.count)")
+                    .font(DesignSystem.Typography.caption)
+                    .foregroundColor(DesignSystem.Colors.textSecondary)
+            }
+            
+            if addresses.isEmpty {
+                Text("No addresses have been derived yet.")
+                    .font(DesignSystem.Typography.bodySmall)
+                    .foregroundColor(DesignSystem.Colors.textSecondary)
+            } else {
+                ForEach(Array(addresses.enumerated()), id: \.offset) { item in
+                    let entry = item.element
+                    HStack(spacing: DesignSystem.Spacing.md) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("#\(entry.index)")
+                                .font(DesignSystem.Typography.caption)
+                                .foregroundColor(DesignSystem.Colors.textSecondary)
+                            Text(entry.address)
+                                .font(DesignSystem.Typography.bodySmall)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .foregroundColor(DesignSystem.Colors.text)
+                        }
+                        
+                        Spacer()
+                        
+                        Button {
+                            UIPasteboard.general.string = entry.address
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                                .foregroundColor(DesignSystem.Colors.secondary)
+                        }
+                        .accessibilityLabel("Copy address #\(entry.index)")
+                    }
+                    .padding(.vertical, DesignSystem.Spacing.xs)
+                    .background(DesignSystem.Colors.surface.opacity(0.5))
+                    .cornerRadius(DesignSystem.CornerRadius.medium)
+                }
+            }
+        }
+    }
+    
+    private func mapTelestaiTransaction(_ transaction: TLSTransaction) -> WalletTransaction {
+        let lowerType = transaction.type.lowercased()
+        let txType: WalletTransaction.TransactionType = lowerType == "send" ? .send : .receive
+        let amount = txType == .send ? -abs(transaction.amount) : abs(transaction.amount)
+        let status: WalletTransaction.TransactionStatus = transaction.confirmations > 0 ? .confirmed : .pending
+        let date = Date(timeIntervalSince1970: TimeInterval(transaction.timestamp))
+        
+        return WalletTransaction(
+            coinType: .telestai,
+            txid: transaction.txid,
+            amount: amount,
+            fee: transaction.fee,
+            confirmations: transaction.confirmations,
+            timestamp: date,
+            type: txType,
+            fromAddress: transaction.from,
+            toAddress: transaction.to,
+            blockHeight: nil,
+            status: status
+        )
     }
 }
 

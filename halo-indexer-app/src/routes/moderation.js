@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { evaluateModeration } = require('../services/moderation');
+const { evaluateModeration, evaluateMediaModeration } = require('../services/moderation');
 const { getCharterSync } = require('../services/charter');
 
 // Return current moderation charter (versioned)
@@ -21,6 +21,21 @@ router.post('/check', (req, res) => {
     return res.json({ success: true, data: decision });
   } catch (e) {
     return res.status(500).json({ error: 'Moderation check failed' });
+  }
+});
+
+// Media check (image/video URL)
+router.post('/media-check', async (req, res) => {
+  try {
+    const { url, type } = req.body || {};
+    if (typeof url !== 'string' || url.trim().length === 0) {
+      return res.status(400).json({ error: 'Invalid media url' });
+    }
+    const mediaType = (type === 'video' ? 'video' : 'image');
+    const decision = await evaluateMediaModeration(url.trim(), mediaType);
+    return res.json({ success: true, data: decision });
+  } catch (e) {
+    return res.status(500).json({ error: 'Media moderation check failed' });
   }
 });
 

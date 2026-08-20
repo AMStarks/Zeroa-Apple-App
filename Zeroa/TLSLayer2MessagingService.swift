@@ -2,376 +2,616 @@ import Foundation
 import Combine
 import Network
 
-class TLSLayer2MessagingService: ObservableObject {
+private struct MessagingEndpointResolver {
+    private let environmentKey = "L2_MESSAGING_BASE_URL"
+    private let defaultRestBase = "https://halo.telestai.io"
+
+    func restBaseURLString() -> String {
+        let override = ProcessInfo.processInfo.environment[environmentKey]
+        let candidate = override?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? defaultRestBase
+        return candidate.removingTrailingSlash()
+    }
+
+    func websocketURL(for address: String, token: String) -> URL? {
+        let restString = restBaseURLString()
+        guard var comps = URLComponents(string: restString) else { return nil }
+        if let scheme = comps.scheme?.lowercased() {
+            if scheme == "https" { comps.scheme = "wss" }
+            else if scheme == "http" { comps.scheme = "ws" }
+        }
+        let encoded = address.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? address
+        comps.path = "/ws/\(encoded)"
+        comps.queryItems = [URLQueryItem(name: "token", value: token)]
+        return comps.url
+    }
+}
+
+private extension String {
+    func removingTrailingSlash() -> String {
+        hasSuffix("/") ? String(dropLast()) : self
+    }
+
+    var nonEmpty: String? { isEmpty ? nil : self }
+}
+
+final class TLSLayer2MessagingService: ObservableObject {
     static let shared = TLSLayer2MessagingService()
-    
+
     @Published var contacts: [P2PContact] = []
     @Published var conversations: [P2PConversation] = []
     @Published var messages: [P2PMessage] = []
     @Published var isConnected = false
     @Published var connectionStatus = "Disconnected"
-    
+
     private var cancellables = Set<AnyCancellable>()
     private let walletService = WalletService.shared
+    private let haloAPI = HaloAPIService.shared
+    private let crypto = CryptoService.shared
+    private let keychain = KeychainService.shared
+    private let endpointResolver = MessagingEndpointResolver()
+    private lazy var restBaseURLString = endpointResolver.restBaseURLString()
+    private var accountActivationObserver: NSObjectProtocol?
     private var webSocketTask: URLSessionWebSocketTask?
-    private let serverURL = "http://43.224.35.187:8000"
-    private let wsURL = "ws://43.224.35.187:8000/ws"
-    
+    private var pingTimer: Timer?
+    private let contactsStoreKey = "switchboard_contacts_v1"
+    private let messagesStoreKey = "switchboard_messages_v1"
+
+    private var isMessagingFeatureEnabled: Bool { Self.messagingFeatureEnabled() }
+
+    private var isProfileActive: Bool {
+        AppGroupsService.shared.isProfileActive()
+    }
+
     init() {
-        setupMockData() // Keep some initial data for UI
+        loadPersistedContacts()
+        loadPersistedMessages()
+        accountActivationObserver = NotificationCenter.default.addObserver(
+            forName: .zeroaAccountActivationChanged,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let isActive = notification.userInfo?["isActive"] as? Bool else { return }
+            if isActive { self?.startConnection() }
+            else { self?.suspendConnection(reason: "Inactive") }
+        }
         startConnection()
     }
-    
-    private func setupMockData() {
-        // Initial mock data for UI testing
-        contacts = [
-            P2PContact(name: "Alice", address: "alice123", publicKey: "pubkey1", isOnline: true),
-            P2PContact(name: "Bob", address: "bob456", publicKey: "pubkey2", isOnline: false),
-            P2PContact(name: "Charlie", address: "charlie789", publicKey: "pubkey3", isOnline: true)
-        ]
-        
-        conversations = [
-            P2PConversation(contactId: "alice123", contactName: "Alice", lastMessage: "Hey, how are you?", unreadCount: 2),
-            P2PConversation(contactId: "bob456", contactName: "Bob", lastMessage: "Thanks for the help!", unreadCount: 0),
-            P2PConversation(contactId: "charlie789", contactName: "Charlie", lastMessage: "See you later!", unreadCount: 1)
-        ]
-        
-        messages = [
-            P2PMessage(senderId: "alice123", receiverId: "self", content: "Hey, how are you?"),
-            P2PMessage(senderId: "self", receiverId: "alice123", content: "I'm good, thanks!"),
-            P2PMessage(senderId: "bob456", receiverId: "self", content: "Thanks for the help!"),
-            P2PMessage(senderId: "charlie789", receiverId: "self", content: "See you later!")
-        ]
+
+    private static func messagingFeatureEnabled() -> Bool {
+        // Switchboard MVP: enabled for com.tls.Zeroa builds.
+        // Kill-switch: UserDefaults ZEROA_DISABLE_HALO_MESSAGING=true
+        if UserDefaults.standard.bool(forKey: "ZEROA_DISABLE_HALO_MESSAGING") { return false }
+        if ProcessInfo.processInfo.environment["ZEROA_DISABLE_HALO_MESSAGING"] == "1" { return false }
+        return true
     }
-    
+
+    // MARK: - Connection
+
     func startConnection() {
-        // Connect to WebSocket for real-time messaging
-        connectWebSocket()
-        
-        // Register with server
-        registerPeer()
-        
-        // Discover peers
-        discoverPeers()
-        
-        // Load message history
-        loadMessageHistory()
-    }
-    
-    private func connectWebSocket() {
-        guard let url = URL(string: "\(wsURL)/\(walletService.loadAddress() ?? "")") else {
-            print("❌ Invalid WebSocket URL")
+        guard isMessagingFeatureEnabled else {
+            suspendConnection(reason: "Halo messaging offline")
             return
         }
-        
-        let session = URLSession(configuration: .default)
-        webSocketTask = session.webSocketTask(with: url)
+        guard isProfileActive else {
+            suspendConnection(reason: "Inactive")
+            return
+        }
+        Task {
+            await HaloService.shared.ensureToken()
+            await MainActor.run { [weak self] in
+                self?.openMessagingChannels()
+            }
+        }
+    }
+
+    private func openMessagingChannels() {
+        guard isMessagingFeatureEnabled, isProfileActive else { return }
+        registerPeer()
+        connectWebSocket()
+        loadMessageHistory()
+    }
+
+    private func suspendConnection(reason: String) {
+        pingTimer?.invalidate()
+        pingTimer = nil
+        webSocketTask?.cancel(with: .goingAway, reason: nil)
+        webSocketTask = nil
+        DispatchQueue.main.async {
+            self.isConnected = false
+            self.connectionStatus = reason
+        }
+    }
+
+    private func currentHaloToken() -> String? {
+        haloAPI.storedToken()?.token
+    }
+
+    private func makeSessionConfiguration() -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.default
+        configuration.waitsForConnectivity = true
+        configuration.timeoutIntervalForRequest = 20
+        configuration.timeoutIntervalForResource = 40
+        return configuration
+    }
+
+    private func connectWebSocket() {
+        guard isMessagingFeatureEnabled, isProfileActive else { return }
+        guard let address = walletService.loadAddress(), !address.isEmpty else { return }
+        guard let token = currentHaloToken() else {
+            connectionStatus = "Missing Halo token"
+            return
+        }
+        guard let url = endpointResolver.websocketURL(for: address, token: token) else { return }
+
+        DispatchQueue.main.async { self.connectionStatus = "Connecting…" }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 20
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        let session = URLSession(configuration: makeSessionConfiguration())
+        webSocketTask?.cancel(with: .goingAway, reason: nil)
+        webSocketTask = session.webSocketTask(with: request)
         webSocketTask?.resume()
-        
         receiveMessage()
-        
+        startPing()
+
         DispatchQueue.main.async {
             self.isConnected = true
             self.connectionStatus = "Connected"
         }
     }
-    
+
+    private func startPing() {
+        pingTimer?.invalidate()
+        pingTimer = Timer.scheduledTimer(withTimeInterval: 25, repeats: true) { [weak self] _ in
+            self?.webSocketTask?.send(.string("{\"type\":\"ping\"}")) { _ in }
+        }
+    }
+
     private func receiveMessage() {
         webSocketTask?.receive { [weak self] result in
             switch result {
             case .success(let message):
                 self?.handleWebSocketMessage(message)
-                self?.receiveMessage() // Continue receiving
-            case .failure(let error):
-                print("❌ WebSocket receive error: \(error)")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-                    self?.connectWebSocket() // Reconnect
+                self?.receiveMessage()
+            case .failure:
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                    guard let self, self.isProfileActive, self.isMessagingFeatureEnabled else { return }
+                    self.connectionStatus = "Reconnecting…"
+                    self.connectWebSocket()
                 }
             }
         }
     }
-    
+
     private func handleWebSocketMessage(_ message: URLSessionWebSocketTask.Message) {
+        let text: String?
         switch message {
-        case .string(let text):
-            if let data = text.data(using: .utf8),
-               let messageData = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                
-                if messageData["type"] as? String == "message",
-                   let data = messageData["data"] as? [String: Any] {
-                    
-                    let message = P2PMessage(
-                        senderId: data["sender_address"] as? String ?? "",
-                        receiverId: data["receiver_address"] as? String ?? "",
-                        content: data["encrypted_content"] as? String ?? "",
-                        messageType: P2PMessage.P2PMessageType(rawValue: data["message_type"] as? String ?? "text") ?? .text
-                    )
-                    
-                    DispatchQueue.main.async {
-                        self.messages.append(message)
-                        self.updateConversation(for: message)
-                    }
+        case .string(let s): text = s
+        case .data(let d): text = String(data: d, encoding: .utf8)
+        @unknown default: text = nil
+        }
+        guard let text,
+              let data = text.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = obj["type"] as? String else { return }
+
+        if type == "message" || type == "message_ack",
+           let payload = obj["data"] as? [String: Any] {
+            if let msg = decodeServerMessage(payload) {
+                DispatchQueue.main.async {
+                    self.upsertMessage(msg)
+                    self.updateConversation(for: msg)
                 }
             }
-        case .data(let data):
-            if let text = String(data: data, encoding: .utf8) {
-                handleWebSocketMessage(.string(text))
-            }
-        @unknown default:
-            break
         }
     }
-    
+
+    // MARK: - Peers / contacts
+
     private func registerPeer() {
-        guard let address = walletService.loadAddress() else { return }
-        
-        let peerData: [String: Any] = [
+        guard let address = walletService.loadAddress(),
+              let pubkey = crypto.getCompressedPublicKeyHex(keychain: keychain) else { return }
+        let body: [String: Any] = [
             "address": address,
-            "public_key": address, // Using address as public key for now
-            "connection_info": [:],
-            "is_online": true
+            "public_key": pubkey,
+            "connection_info": ["websocket": true],
+            "is_online": true,
         ]
-        
-        sendAPIRequest(endpoint: "/api/v1/peer/register", method: "POST", data: peerData) { [weak self] result in
+        sendAPIRequest(endpoint: "/api/v1/peer/register", method: "POST", data: body) { _ in }
+    }
+
+    func lookupPeerPubkey(address: String, completion: @escaping (String?) -> Void) {
+        let encoded = address.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? address
+        sendAPIRequest(endpoint: "/api/v1/peer/\(encoded)", method: "GET") { result in
             switch result {
             case .success(let response):
-                print("✅ Peer registered: \(response)")
-            case .failure(let error):
-                print("❌ Peer registration failed: \(error)")
+                let pubkey = (response as? [String: Any])
+                    .flatMap { $0["peer"] as? [String: Any] }?
+                    .flatMap { $0["public_key"] as? String }
+                completion((pubkey?.isEmpty == false) ? pubkey : nil)
+            case .failure:
+                completion(nil)
             }
         }
     }
-    
-    private func discoverPeers() {
-        guard let address = walletService.loadAddress() else { return }
-        
-        sendAPIRequest(endpoint: "/api/v1/peers/discover?address=\(address)", method: "GET") { [weak self] result in
-            switch result {
-            case .success(let response):
-                if let data = response as? [String: Any],
-                   let peersData = data["peers"] as? [[String: Any]] {
-                    
-                    DispatchQueue.main.async {
-                        self?.contacts = peersData.compactMap { peerData in
-                            guard let address = peerData["address"] as? String,
-                                  let publicKey = peerData["public_key"] as? String else { return nil }
-                            
-                            return P2PContact(
-                                name: address, // Use address as name for now
-                                address: address,
-                                publicKey: publicKey,
-                                isOnline: peerData["is_online"] as? Bool ?? false
-                            )
-                        }
-                    }
-                }
-            case .failure(let error):
-                print("❌ Peer discovery failed: \(error)")
+
+    func addContact(name: String, address: String, publicKey: String? = nil) {
+        let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        func finish(with pubkey: String) {
+            let contact = P2PContact(
+                id: trimmed,
+                name: name.isEmpty ? String(trimmed.prefix(12)) : name,
+                address: trimmed,
+                publicKey: pubkey,
+                isOnline: false
+            )
+            DispatchQueue.main.async {
+                self.contacts.removeAll { $0.address == trimmed }
+                self.contacts.insert(contact, at: 0)
+                self.persistContacts()
             }
         }
-    }
-    
-    private func loadMessageHistory() {
-        guard let address = walletService.loadAddress() else { return }
-        
-        sendAPIRequest(endpoint: "/api/v1/messages/\(address)", method: "GET") { [weak self] result in
-            switch result {
-            case .success(let response):
-                if let data = response as? [String: Any],
-                   let messagesData = data["messages"] as? [[String: Any]] {
-                    
-                    DispatchQueue.main.async {
-                        self?.messages = messagesData.compactMap { messageData in
-                            guard let senderId = messageData["sender_address"] as? String,
-                                  let receiverId = messageData["receiver_address"] as? String,
-                                  let content = messageData["encrypted_content"] as? String else { return nil }
-                            
-                            return P2PMessage(
-                                senderId: senderId,
-                                receiverId: receiverId,
-                                content: content,
-                                messageType: P2PMessage.P2PMessageType(rawValue: messageData["message_type"] as? String ?? "text") ?? .text
-                            )
-                        }
-                        
-                        // Update conversations based on messages
-                        self?.updateConversationsFromMessages()
-                    }
-                }
-            case .failure(let error):
-                print("❌ Message history load failed: \(error)")
-            }
-        }
-    }
-    
-    private func sendAPIRequest(endpoint: String, method: String, data: [String: Any]? = nil, completion: @escaping (Result<Any, Error>) -> Void) {
-        guard let url = URL(string: "\(serverURL)\(endpoint)") else {
-            completion(.failure(NSError(domain: "Invalid URL", code: -1)))
+
+        if let publicKey, !publicKey.isEmpty {
+            finish(with: publicKey)
             return
         }
-        
+        lookupPeerPubkey(address: trimmed) { pubkey in
+            finish(with: pubkey ?? "")
+        }
+    }
+
+    func removeContact(_ contact: P2PContact) {
+        DispatchQueue.main.async {
+            self.contacts.removeAll { $0.address == contact.address }
+            self.persistContacts()
+        }
+    }
+
+    private func loadPersistedContacts() {
+        guard let data = UserDefaults.standard.data(forKey: contactsStoreKey),
+              let decoded = try? JSONDecoder().decode([P2PContact].self, from: data) else { return }
+        contacts = decoded
+    }
+
+    private func persistContacts() {
+        if let data = try? JSONEncoder().encode(contacts) {
+            UserDefaults.standard.set(data, forKey: contactsStoreKey)
+        }
+    }
+
+    private func loadPersistedMessages() {
+        guard let data = UserDefaults.standard.data(forKey: messagesStoreKey),
+              let decoded = try? JSONDecoder().decode([P2PMessage].self, from: data) else { return }
+        messages = decoded
+        updateConversationsFromMessages()
+    }
+
+    private func persistMessages() {
+        if let data = try? JSONEncoder().encode(messages.suffix(500)) {
+            UserDefaults.standard.set(data, forKey: messagesStoreKey)
+        }
+    }
+
+    private func pubkey(for address: String) -> String? {
+        if let c = contacts.first(where: { $0.address == address }), !c.publicKey.isEmpty {
+            return c.publicKey
+        }
+        return nil
+    }
+
+    // MARK: - Messages
+
+    private func loadMessageHistory() {
+        guard let address = walletService.loadAddress() else { return }
+        let encoded = address.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? address
+        sendAPIRequest(endpoint: "/api/v1/messages/\(encoded)", method: "GET") { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let response):
+                guard let data = response as? [String: Any],
+                      let rows = data["messages"] as? [[String: Any]] else { return }
+                let decoded = rows.compactMap { self.decodeServerMessage($0) }
+                DispatchQueue.main.async {
+                    // Merge server decrypts with locally cached plaintext
+                    var byId = Dictionary(uniqueKeysWithValues: self.messages.map { ($0.id, $0) })
+                    for msg in decoded {
+                        if let existing = byId[msg.id],
+                           (msg.content == "(encrypted)" || msg.content == "(unable to decrypt)"),
+                           !existing.content.hasPrefix("(") {
+                            byId[msg.id] = existing
+                        } else {
+                            byId[msg.id] = msg
+                        }
+                    }
+                    self.messages = Array(byId.values).sorted { $0.timestamp < $1.timestamp }
+                    self.persistMessages()
+                    self.updateConversationsFromMessages()
+                }
+            case .failure(let error):
+                print("❌ Switchboard history: \(error)")
+            }
+        }
+    }
+
+    private func decodeServerMessage(_ data: [String: Any]) -> P2PMessage? {
+        guard let sender = data["sender_address"] as? String,
+              let receiver = data["receiver_address"] as? String,
+              let encrypted = data["encrypted_content"] as? String else { return nil }
+        let id = data["id"] as? String ?? UUID().uuidString
+        let ts: Date = {
+            if let s = data["timestamp"] as? String {
+                let f = ISO8601DateFormatter()
+                f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                if let d = f.date(from: s) { return d }
+                f.formatOptions = [.withInternetDateTime]
+                return f.date(from: s) ?? Date()
+            }
+            return Date()
+        }()
+
+        let plaintext: String
+        if let me = walletService.loadAddress(), sender == me {
+            // Own outbound: try decrypt (works if we were recipient of echo) else show placeholder until local cache
+            if let p = crypto.decryptDirectMessage(payload: encrypted, keychain: keychain) {
+                plaintext = p
+            } else if let cached = messages.first(where: { $0.id == id })?.content {
+                plaintext = cached
+            } else {
+                plaintext = "(encrypted)"
+            }
+        } else if let p = crypto.decryptDirectMessage(payload: encrypted, keychain: keychain) {
+            plaintext = p
+        } else {
+            plaintext = "(unable to decrypt)"
+        }
+
+        return P2PMessage(
+            id: id,
+            senderId: sender,
+            receiverId: receiver,
+            content: plaintext,
+            timestamp: ts,
+            messageType: .text,
+            isRead: false
+        )
+    }
+
+    func sendP2PMessage(to contactAddress: String, content: String) {
+        sendMessage(to: contactAddress, content: content)
+    }
+
+    func sendMessage(to contactAddress: String, content: String) {
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard let sender = walletService.loadAddress() else { return }
+
+        Task {
+            await HaloService.shared.ensureToken()
+            var recipientKey = self.pubkey(for: contactAddress)
+            if recipientKey == nil || recipientKey?.isEmpty == true {
+                recipientKey = await withCheckedContinuation { cont in
+                    self.lookupPeerPubkey(address: contactAddress) { cont.resume(returning: $0) }
+                }
+            }
+            guard let recipientKey, !recipientKey.isEmpty else {
+                await MainActor.run { self.connectionStatus = "Recipient has no public key yet" }
+                return
+            }
+            guard let encrypted = crypto.encryptDirectMessage(
+                plaintext: trimmed,
+                recipientCompressedPubkeyHex: recipientKey,
+                keychain: keychain
+            ),
+            let senderPub = crypto.getCompressedPublicKeyHex(keychain: keychain) else { return }
+
+            let ts = ISO8601DateFormatter().string(from: Date())
+            let canonical = "MSG|\(sender)|\(contactAddress)|\(encrypted)|\(ts)"
+            guard let signature = crypto.signMessageBase64(canonical, keychain: keychain) else { return }
+
+            let body: [String: Any] = [
+                "sender_address": sender,
+                "receiver_address": contactAddress,
+                "encrypted_content": encrypted,
+                "message_type": "text",
+                "signature": signature,
+                "sender_pubkey": senderPub,
+                "timestamp": ts,
+            ]
+
+            // Optimistic local plaintext
+            let local = P2PMessage(
+                senderId: sender,
+                receiverId: contactAddress,
+                content: trimmed,
+                messageType: .text
+            )
+            await MainActor.run {
+                self.upsertMessage(local)
+                self.updateConversation(for: local)
+            }
+
+            sendAPIRequest(endpoint: "/api/v1/message/relay", method: "POST", data: body) { [weak self] result in
+                switch result {
+                case .success(let response):
+                    if let dict = response as? [String: Any],
+                       let msg = dict["message"] as? [String: Any],
+                       let id = msg["id"] as? String {
+                        DispatchQueue.main.async {
+                            if let idx = self?.messages.firstIndex(where: { $0.id == local.id }) {
+                                let updated = P2PMessage(
+                                    id: id,
+                                    senderId: sender,
+                                    receiverId: contactAddress,
+                                    content: trimmed,
+                                    timestamp: local.timestamp,
+                                    messageType: .text,
+                                    isRead: true
+                                )
+                                self?.messages[idx] = updated
+                            }
+                        }
+                    }
+                case .failure(let error):
+                    print("❌ Switchboard send failed: \(error)")
+                    DispatchQueue.main.async {
+                        self?.connectionStatus = "Send failed"
+                    }
+                }
+            }
+        }
+    }
+
+    func getMessages(for contactAddress: String) -> [P2PMessage] {
+        guard let me = walletService.loadAddress() else { return [] }
+        return messages
+            .filter {
+                ($0.senderId == contactAddress && $0.receiverId == me) ||
+                ($0.senderId == me && $0.receiverId == contactAddress)
+            }
+            .sorted { $0.timestamp < $1.timestamp }
+    }
+
+    func markAsRead(contactAddress: String) {
+        // Local-only for MVP
+        DispatchQueue.main.async {
+            if let idx = self.conversations.firstIndex(where: { $0.contactId == contactAddress }) {
+                let c = self.conversations[idx]
+                self.conversations[idx] = P2PConversation(
+                    id: c.id,
+                    contactId: c.contactId,
+                    contactName: c.contactName,
+                    lastMessage: c.lastMessage,
+                    timestamp: c.timestamp,
+                    unreadCount: 0
+                )
+            }
+        }
+    }
+
+    private func upsertMessage(_ message: P2PMessage) {
+        if let idx = messages.firstIndex(where: { $0.id == message.id }) {
+            messages[idx] = message
+        } else if !messages.contains(where: {
+            $0.senderId == message.senderId &&
+            $0.receiverId == message.receiverId &&
+            $0.content == message.content &&
+            abs($0.timestamp.timeIntervalSince(message.timestamp)) < 2
+        }) {
+            messages.append(message)
+        }
+        persistMessages()
+    }
+
+    private func updateConversation(for message: P2PMessage) {
+        guard let me = walletService.loadAddress() else { return }
+        let other = message.senderId == me ? message.receiverId : message.senderId
+        let name = contacts.first(where: { $0.address == other })?.name ?? String(other.prefix(12))
+        let unread = message.senderId == me ? 0 : 1
+        if let idx = conversations.firstIndex(where: { $0.contactId == other }) {
+            let prev = conversations[idx]
+            conversations[idx] = P2PConversation(
+                id: prev.id,
+                contactId: other,
+                contactName: name,
+                lastMessage: message.content,
+                timestamp: message.timestamp,
+                unreadCount: prev.unreadCount + unread
+            )
+        } else {
+            conversations.insert(
+                P2PConversation(
+                    contactId: other,
+                    contactName: name,
+                    lastMessage: message.content,
+                    unreadCount: unread
+                ),
+                at: 0
+            )
+        }
+        conversations.sort { $0.timestamp > $1.timestamp }
+    }
+
+    private func updateConversationsFromMessages() {
+        guard let me = walletService.loadAddress() else { return }
+        var map: [String: P2PConversation] = [:]
+        for message in messages.sorted(by: { $0.timestamp < $1.timestamp }) {
+            let other = message.senderId == me ? message.receiverId : message.senderId
+            let name = contacts.first(where: { $0.address == other })?.name ?? String(other.prefix(12))
+            map[other] = P2PConversation(
+                contactId: other,
+                contactName: name,
+                lastMessage: message.content,
+                timestamp: message.timestamp,
+                unreadCount: 0
+            )
+        }
+        conversations = map.values.sorted { $0.timestamp > $1.timestamp }
+    }
+
+    // MARK: - HTTP
+
+    private func sendAPIRequest(
+        endpoint: String,
+        method: String,
+        data: [String: Any]? = nil,
+        completion: @escaping (Result<Any, Error>) -> Void
+    ) {
+        guard isMessagingFeatureEnabled else {
+            completion(.failure(NSError(domain: "MessagingService", code: -13, userInfo: [NSLocalizedDescriptionKey: "Halo messaging disabled"])))
+            return
+        }
+        guard isProfileActive else {
+            completion(.failure(NSError(domain: "MessagingService", code: -10, userInfo: [NSLocalizedDescriptionKey: "Account inactive"])))
+            return
+        }
+        guard let token = currentHaloToken() else {
+            completion(.failure(NSError(domain: "MessagingService", code: -11, userInfo: [NSLocalizedDescriptionKey: "Missing Halo token"])))
+            return
+        }
+        guard let url = URL(string: "\(restBaseURLString)\(endpoint)") else {
+            completion(.failure(NSError(domain: "MessagingService", code: -12, userInfo: [NSLocalizedDescriptionKey: "Invalid URL"])))
+            return
+        }
+
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        
-        if let data = data {
-            request.httpBody = try? JSONSerialization.data(withJSONObject: data)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let bundleId = Bundle.main.bundleIdentifier {
+            request.setValue(bundleId, forHTTPHeaderField: "X-Bundle-Id")
         }
-        
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            if let error = error {
-                completion(.failure(error))
-                return
-            }
-            
-            guard let data = data else {
+        request.timeoutInterval = 20
+        if let data { request.httpBody = try? JSONSerialization.data(withJSONObject: data) }
+
+        URLSession(configuration: makeSessionConfiguration()).dataTask(with: request) { data, response, error in
+            if let error { completion(.failure(error)); return }
+            guard let data else {
                 completion(.failure(NSError(domain: "No data", code: -1)))
                 return
             }
-            
+            if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                let body = String(data: data, encoding: .utf8) ?? ""
+                completion(.failure(NSError(domain: "MessagingService", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: body])))
+                return
+            }
             do {
-                let json = try JSONSerialization.jsonObject(with: data)
-                completion(.success(json))
+                completion(.success(try JSONSerialization.jsonObject(with: data)))
             } catch {
                 completion(.failure(error))
             }
         }.resume()
     }
-    
-    func sendMessage(to contactId: String, content: String) {
-        guard let senderAddress = walletService.loadAddress() else { return }
-        
-        let messageData: [String: Any] = [
-            "sender_address": senderAddress,
-            "receiver_address": contactId,
-            "encrypted_content": content, // In production, this should be encrypted
-            "message_type": "text",
-            "signature": "dummy_signature" // In production, this should be a real signature
-        ]
-        
-        sendAPIRequest(endpoint: "/api/v1/message/relay", method: "POST", data: messageData) { [weak self] result in
-            switch result {
-            case .success(let response):
-                print("✅ Message sent: \(response)")
-                
-                // Add message locally
-                let message = P2PMessage(senderId: senderAddress, receiverId: contactId, content: content)
-                DispatchQueue.main.async {
-                    self?.messages.append(message)
-                    self?.updateConversation(for: message)
-                }
-                
-            case .failure(let error):
-                print("❌ Message send failed: \(error)")
-            }
-        }
-    }
-    
-    private func updateConversation(for message: P2PMessage) {
-        let contactId = message.senderId == walletService.loadAddress() ? message.receiverId : message.senderId
-        
-        if let index = conversations.firstIndex(where: { $0.contactId == contactId }) {
-            conversations[index] = P2PConversation(
-                contactId: contactId,
-                contactName: conversations[index].contactName,
-                lastMessage: message.content,
-                unreadCount: message.senderId != walletService.loadAddress() ? conversations[index].unreadCount + 1 : 0
-            )
-        } else {
-            // Create new conversation
-            let contact = contacts.first { $0.address == contactId }
-            let conversation = P2PConversation(
-                contactId: contactId,
-                contactName: contact?.name ?? contactId,
-                lastMessage: message.content,
-                unreadCount: message.senderId != walletService.loadAddress() ? 1 : 0
-            )
-            conversations.append(conversation)
-        }
-    }
-    
-    private func updateConversationsFromMessages() {
-        var conversationMap: [String: P2PConversation] = [:]
-        
-        for message in messages {
-            let contactId = message.senderId == walletService.loadAddress() ? message.receiverId : message.senderId
-            
-            if let existing = conversationMap[contactId] {
-                conversationMap[contactId] = P2PConversation(
-                    contactId: contactId,
-                    contactName: existing.contactName,
-                    lastMessage: message.content,
-                    unreadCount: message.senderId != walletService.loadAddress() ? existing.unreadCount + 1 : existing.unreadCount
-                )
-            } else {
-                let contact = contacts.first { $0.address == contactId }
-                conversationMap[contactId] = P2PConversation(
-                    contactId: contactId,
-                    contactName: contact?.name ?? contactId,
-                    lastMessage: message.content,
-                    unreadCount: message.senderId != walletService.loadAddress() ? 1 : 0
-                )
-            }
-        }
-        
-        conversations = Array(conversationMap.values)
-    }
-    
-    func getMessages(for contactId: String) -> [P2PMessage] {
-        return messages.filter { message in
-            (message.senderId == contactId && message.receiverId == walletService.loadAddress()) ||
-            (message.senderId == walletService.loadAddress() && message.receiverId == contactId)
-        }.sorted { $0.timestamp < $1.timestamp }
-    }
-    
-    func addContact(name: String, address: String, publicKey: String) {
-        let contact = P2PContact(name: name, address: address, publicKey: publicKey)
-        contacts.append(contact)
-    }
-    
-    func getContacts() -> [P2PContact] {
-        return contacts
-    }
-    
-    func sendP2PMessage(to contactId: String, content: String) async -> Bool {
-        sendMessage(to: contactId, content: content)
-        return true
-    }
-    
-    func removeContact(contactId: String) {
-        contacts.removeAll { $0.id == contactId }
-        conversations.removeAll { $0.contactId == contactId }
-        messages.removeAll { $0.senderId == contactId || $0.receiverId == contactId }
-    }
-    
-    func markAsRead(contactId: String) {
-        // Mark messages as read
-        for i in 0..<messages.count {
-            if messages[i].senderId == contactId && messages[i].receiverId == walletService.loadAddress() {
-                messages[i] = P2PMessage(
-                    id: messages[i].id,
-                    senderId: messages[i].senderId,
-                    receiverId: messages[i].receiverId,
-                    content: messages[i].content,
-                    timestamp: messages[i].timestamp,
-                    messageType: messages[i].messageType,
-                    isRead: true
-                )
-            }
-        }
-        
-        // Update conversation unread count
-        if let index = conversations.firstIndex(where: { $0.contactId == contactId }) {
-            conversations[index] = P2PConversation(
-                contactId: contactId,
-                contactName: conversations[index].contactName,
-                lastMessage: conversations[index].lastMessage,
-                unreadCount: 0
-            )
-        }
-    }
-    
+
     deinit {
-        webSocketTask?.cancel()
+        if let observer = accountActivationObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        pingTimer?.invalidate()
+        webSocketTask?.cancel(with: .goingAway, reason: nil)
     }
 }

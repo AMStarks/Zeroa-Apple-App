@@ -3,6 +3,8 @@ import Combine
 import EventKit
 import MapKit
 import WebKit
+import LocalAuthentication
+import CryptoKit
 
 // MARK: - Helper Functions
 func formatWithThousandsSeparators(_ integerPart: String) -> String {
@@ -72,8 +74,16 @@ struct AnalyticsData {
     let weeklyUsage: [String: Int]
 }
 
+extension Notification.Name {
+    static let zeroaNavigateToProfile = Notification.Name("ZeroaNavigateToProfile")
+    static let zeroaAccountActivationChanged = Notification.Name("ZeroaAccountActivationChanged")
+    static let zeroaDisplayNameDidChange = Notification.Name("ZeroaDisplayNameDidChange")
+    static let zeroaOpenSeedSecurity = Notification.Name("ZeroaOpenSeedSecurity")
+}
+
 // MARK: - Main Content View
 struct ContentView: View {
+    @EnvironmentObject var authManager: AuthManager
     @State private var address = ""
     @State private var mnemonic = ""
     @State private var isCheckingLogin = false
@@ -85,21 +95,11 @@ struct ContentView: View {
     // @StateObject private var messagingService = MessagingService.shared // Moved to inactive
     // TinyLlama now uses server-based integration
     
-    // Messaging state variables
-    // @State private var conversations: [ChatConversation] = [] // Types moved to inactive
-    // @State private var currentConversation: ChatConversation? // Types moved to inactive
-    @State private var messageText = ""
-    @State private var showNewChat = false
-    @State private var newContactName = ""
-    @State private var newContactAddress = ""
-    
     // Sheet state variables
     @State private var showSubscriptionAlert = false
     @State private var showSendSheet = false
     @State private var showReceiveSheet = false
     @State private var showTransactionsSheet = false
-    @State private var showMessaging = false
-    @State private var showHamburgerMenu = false
     @State private var selectedTab = 0
     @State private var showSignInModal = false
     @StateObject private var themeManager = ThemeManager.shared
@@ -141,6 +141,9 @@ struct ContentView: View {
                         SecondaryButton(title: "Create New Account") {
                             path.append("create")
                         }
+
+                        IdPContactSignInSection(path: $path)
+                            .environmentObject(authManager)
                     }
                     .padding(.horizontal, DesignSystem.Spacing.lg)
                     
@@ -157,7 +160,9 @@ struct ContentView: View {
             .navigationDestination(for: String.self) { value in
                 switch value {
                 case "home":
-                    HomeView(path: $path, tlsService: tlsService)
+                    DashboardView(path: $path, tlsService: tlsService)
+                case "wallet":
+                    WalletView(path: $path, tlsService: tlsService)
                 case "create":
                     CreateAccountView(path: $path)
                 case "prioritization":
@@ -166,8 +171,6 @@ struct ContentView: View {
                     StatsView(path: $path)
                 case "userPortal":
                     UserPortalView(path: $path)
-                case "profile":
-                    ProfileView(path: $path)
                 case "messaging":
                     HybridMessagingView()
                 case "settings":
@@ -176,6 +179,8 @@ struct ContentView: View {
                     SupportView(path: $path)
                 case "ai":
                     AIFeaturesView(path: $path)
+                case "seedSecurity":
+                    SeedPhraseSecurityView(path: $path)
                 case "ai-companion":
                     // CompanionManagementView(path: $path) // Moved to inactive
                     Text("Companion Management - Feature Disabled")
@@ -196,6 +201,10 @@ struct ContentView: View {
             .onAppear {
                 checkAutoLogin()
             }
+            .onReceive(NotificationCenter.default.publisher(for: .zeroaNavigateToProfile)) { _ in
+                selectedTab = 0
+                path = NavigationPath()
+            }
         }
         .sheet(isPresented: $showSubscriptionAlert) {
             SubscriptionView()
@@ -208,17 +217,6 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showTransactionsSheet) {
             TransactionHistoryView()
-        }
-        .sheet(isPresented: $showMessaging) {
-            HybridMessagingView()
-        }
-        .sheet(isPresented: $showNewChat) {
-            // NewChatView( // Moved to inactive
-            //     newContactName: $newContactName,
-            //     newContactAddress: $newContactAddress,
-            //     conversations: $conversations
-            // )
-            Text("New Chat - Feature Disabled")
         }
         .sheet(isPresented: $showSignInModal) {
             SignInModalView(
@@ -256,11 +254,19 @@ struct ContentView: View {
             return
         }
         
-        walletService.importMnemonic(mnemonic) { success, derivedAddress in
-            if success, derivedAddress == address {
+        let trimmedAddress = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        walletService.importMnemonic(mnemonic, expectedAddress: trimmedAddress) { success, derivedAddress in
+            if success, let derived = derivedAddress, derived == trimmedAddress {
+                print("✅ ContentView.handleSignIn: Login successful, address: \(derived)")
+                // Update auth manager state so LASKO requests can be processed
+                authManager.isAuthenticated = true
+                print("🔍 ContentView.handleSignIn: authManager.isAuthenticated set to true")
+                Task {
+                    await HaloService.shared.ensureToken()
+                }
                 path.append("home")
             } else {
-                errorMessage = "Invalid address or mnemonic"
+                errorMessage = "Invalid address or mnemonic. Please check your address and seed phrase."
                 showError = true
             }
             isCheckingLogin = false
@@ -271,15 +277,33 @@ struct ContentView: View {
         guard !isCheckingLogin else { return }
         isCheckingLogin = true
         
-        if let savedAddress = walletService.loadAddress(),
-           let savedMnemonic = walletService.keychain.read(key: "wallet_mnemonic") {
-            walletService.importMnemonic(savedMnemonic) { success, derivedAddress in
-                if success, derivedAddress == savedAddress {
-                    path.append("home")
+        // CRITICAL: Only auto-login if saved address matches the last address that was logged in with
+        guard let savedAddress = walletService.loadAddress(),
+              let lastLoggedInAddress = walletService.getLastLoggedInAddress(),
+              savedAddress == lastLoggedInAddress,
+              let savedMnemonic = walletService.keychain.read(key: "wallet_mnemonic") else {
+            print("❌ Auto-login blocked: saved address doesn't match last logged in address")
+            print("   Saved: \(walletService.loadAddress() ?? "nil")")
+            print("   Last logged in: \(walletService.getLastLoggedInAddress() ?? "nil")")
+            isCheckingLogin = false
+            return
+        }
+        
+        print("✅ Auto-login allowed: saved address matches last logged in address")
+        // CRITICAL: Always pass the saved address as expectedAddress to prevent wrong derivation
+        walletService.importMnemonic(savedMnemonic, expectedAddress: savedAddress) { success, derivedAddress in
+            if success, let derived = derivedAddress, derived == savedAddress {
+                print("✅ ContentView.checkAutoLogin: Auto-login successful, address: \(derived)")
+                // Update auth manager state so LASKO requests can be processed
+                authManager.isAuthenticated = true
+                print("🔍 ContentView.checkAutoLogin: authManager.isAuthenticated set to true")
+                Task {
+                    await HaloService.shared.ensureToken()
                 }
-                isCheckingLogin = false
+                path.append("home")
+            } else {
+                print("❌ Auto-login failed: derived address '\(derivedAddress ?? "nil")' doesn't match saved '\(savedAddress)'")
             }
-        } else {
             isCheckingLogin = false
         }
     }
@@ -290,6 +314,7 @@ struct ContentView: View {
 // MARK: - Create Account View
 struct CreateAccountView: View {
     @Binding var path: NavigationPath
+    @EnvironmentObject var authManager: AuthManager
     @State private var mnemonic = ""
     @State private var hasWrittenDown = false
     @State private var showMnemonic = false  // Hide mnemonic by default
@@ -316,6 +341,14 @@ struct CreateAccountView: View {
                         .multilineTextAlignment(.center)
                 }
                 .padding(.top, DesignSystem.Spacing.xxl)
+
+                IdPContactSignInSection(path: $path)
+                    .environmentObject(authManager)
+                    .padding(.top, DesignSystem.Spacing.sm)
+
+                Text("Or create with a recovery phrase now")
+                    .font(DesignSystem.Typography.caption)
+                    .foregroundColor(DesignSystem.Colors.textSecondary)
                 
                 Spacer()
                 
@@ -397,8 +430,14 @@ struct CreateAccountView: View {
             isCreating = false
             if success {
                     print("✅ Account created successfully with address: \(derivedAddress ?? "unknown")")
-                    // Navigate to home screen
+                    BackupStatusStore.markCeremonyComplete()
+                    AppGroupsService.shared.setProfileActive(true)
+                    if let addr = derivedAddress {
+                        AppGroupsService.shared.storeTLSAddress(addr)
+                    }
+                    authManager.isAuthenticated = true
                     path.append("home")
+                    Task { await HaloService.shared.ensureToken() }
                 } else {
                     print("❌ Failed to create account")
                     // Could add error handling here if needed
@@ -494,12 +533,13 @@ struct SignInModalView: View {
             return
         }
         
-        walletService.importMnemonic(mnemonic) { success, derivedAddress in
-            if success, derivedAddress == address {
+        let trimmedAddress = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        walletService.importMnemonic(mnemonic, expectedAddress: trimmedAddress) { success, derivedAddress in
+            if success, let derived = derivedAddress, derived == trimmedAddress {
                 dismiss()
                 path.append("home")
             } else {
-                errorMessage = "Invalid address or seed phrase"
+                errorMessage = "Invalid address or seed phrase. Please check your address and seed phrase."
                 showError = true
             }
             isCheckingLogin = false
@@ -508,7 +548,7 @@ struct SignInModalView: View {
 }
 
 // MARK: - Home View
-struct HomeView: View {
+struct DashboardView: View {
     @Binding var path: NavigationPath
     // @ObservedObject var assistantService: AssistantService // Moved to inactive
     @ObservedObject var tlsService: TLSBlockchainService
@@ -526,17 +566,11 @@ struct HomeView: View {
     // @State private var prioritizedMessages: [ChatMessage] = [] // Types moved to inactive
     // Coin Selection and Data
     @State private var selectedCoin: String = "Telestai"
-    @State private var availableCoins = ["Telestai", "Bitcoin", "USDT", "USDC", "Litecoin", "Flux", "Kaspa"]
+    @State private var availableCoins = ["Telestai"]
     @State private var showFilter = false
-    @State private var filteredCoins: [String] = ["Telestai", "Bitcoin", "USDT", "USDC", "Litecoin", "Flux", "Kaspa"]
+    @State private var filteredCoins: [String] = ["Telestai"]
     @State private var enabledCoins: [String: Bool] = [
-        "Telestai": true,
-        "Bitcoin": true,
-        "USDT": true,
-        "USDC": true,
-        "Litecoin": true,
-        "Flux": true,
-        "Kaspa": true
+        "Telestai": true
     ]
     @State private var coinBalance: Double = 0.0
     @State private var coinPrice: Double = 0.0
@@ -596,21 +630,17 @@ struct HomeView: View {
     
     // Bottom Navigation
     @State private var selectedTab = 0
-    @State private var showMessaging = false
-    @State private var showHamburgerMenu = false
-    
-    // BitChat Messaging
-    // @State private var conversations: [ChatConversation] = [] // Types moved to inactive
-    // @State private var currentConversation: ChatConversation? // Types moved to inactive
-    @State private var messageText = ""
-    @State private var showNewChat = false
-    @State private var newContactName = ""
-    @State private var newContactAddress = ""
     
     @StateObject private var themeManager = ThemeManager.shared
     // Focus state removed - functionality preserved for future use
     private let walletService = WalletService.shared
     private let networkService = NetworkService.shared
+
+    init(path: Binding<NavigationPath>, tlsService: TLSBlockchainService, initialTab: Int = 0) {
+        self._path = path
+        self.tlsService = tlsService
+        _selectedTab = State(initialValue: initialTab)
+    }
 
     // Place the following functions at the top level of HomeView, after property declarations and before the body property:
     private func loadCoinData() {
@@ -620,49 +650,12 @@ struct HomeView: View {
     }
 
     private func loadCoinDataAsync() async {
-        // Update coin-specific data based on selection
-        switch selectedCoin {
-        case "Telestai":
-            await loadTLSData()
-            // Update coin variables with TLS data
-            await MainActor.run {
-                self.coinBalance = self.tlsBalance
-                self.coinPrice = self.tlsPrice
-                self.coinPriceChange = self.tlsPriceChange
-                self.priceHistory = self.tlsPriceHistory
-            }
-        case "Bitcoin":
-            await loadBitcoinData()
-            await MainActor.run {
-                self.priceHistory = self.bitcoinPriceHistory
-            }
-        case "USDT":
-            await loadUSDTData()
-            await MainActor.run {
-                self.priceHistory = self.usdtPriceHistory
-            }
-        case "USDC":
-            await loadUSDCData()
-            await MainActor.run {
-                self.priceHistory = self.usdcPriceHistory
-            }
-        case "Litecoin":
-            await loadLitecoinData()
-            await MainActor.run {
-                self.priceHistory = self.litecoinPriceHistory
-            }
-        case "Flux":
-            await loadFluxData()
-            await MainActor.run {
-                self.priceHistory = self.fluxPriceHistory
-            }
-        case "Kaspa":
-            await loadKaspaData()
-            await MainActor.run {
-                self.priceHistory = self.kaspaPriceHistory
-            }
-        default:
-            await loadTLSData()
+        await loadTLSData()
+        await MainActor.run {
+            self.coinBalance = self.tlsBalance
+            self.coinPrice = self.tlsPrice
+            self.coinPriceChange = self.tlsPriceChange
+            self.priceHistory = self.tlsPriceHistory
         }
     }
 
@@ -1812,24 +1805,10 @@ struct HomeView: View {
     
     // MARK: - Helper Functions for Coin Data
     private func getCoinBalance(for coin: String) -> Double {
-        switch coin {
-        case "Telestai":
-            return tlsBalance
-        case "Bitcoin":
-            return 0.0
-        case "USDT":
-            return 0.0
-        case "USDC":
-            return 0.0
-        case "Litecoin":
-            return 0.0
-        case "Flux":
-            return coinBalance
-        case "Kaspa":
-            return 0.0
-        default:
+        guard coin == "Telestai" else {
             return 0.0
         }
+        return tlsService.currentBalance
     }
     
     private func getCoinPrice(for coin: String) -> Double {
@@ -1933,8 +1912,35 @@ struct HomeView: View {
                 .ignoresSafeArea()
             
             VStack(spacing: 0) {
+                if BackupStatusStore.isIncomplete {
+                    Button {
+                        path.append("seedSecurity")
+                    } label: {
+                        HStack(spacing: DesignSystem.Spacing.sm) {
+                            Image(systemName: "exclamationmark.shield.fill")
+                            Text("Backup incomplete — tap to secure your recovery phrase")
+                                .font(DesignSystem.Typography.bodySmall)
+                                .multilineTextAlignment(.leading)
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                        }
+                        .foregroundColor(DesignSystem.Colors.onPrimary)
+                        .padding(DesignSystem.Spacing.md)
+                        .background(DesignSystem.Colors.warning)
+                    }
+                }
+
                 // Debug buttons removed per request
                 
+                if selectedTab == 0 {
+                    HomeView(path: $path, isRoot: true)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .padding(.bottom, DesignSystem.Spacing.lg)
+                } else if selectedTab == 1 {
+                    HybridMessagingView(showsBackButton: false)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .padding(.bottom, DesignSystem.Spacing.lg)
+                } else if selectedTab == 2 {
                 // Selected Coin Details Card - Moved to top
                 if selectedCoin != "" {
                     CardView {
@@ -2156,16 +2162,13 @@ struct HomeView: View {
                 
                 Spacer()
                 
-
+                } else if selectedTab == 3 {
+                    MenuScreenView(path: $path, showLogoutAlert: $showLogoutAlert)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
                 
                 // Bottom Navigation
-                BottomNavigationView(
-                    selectedTab: $selectedTab,
-                    showMessaging: $showMessaging,
-                    showHamburgerMenu: $showHamburgerMenu,
-                    path: $path,
-                    themeManager: themeManager
-                )
+                BottomNavigationView(selectedTab: $selectedTab)
             }
         }
         .alert("Success", isPresented: $showAlert) {
@@ -2180,9 +2183,6 @@ struct HomeView: View {
             Button("Cancel", role: .cancel) { }
         } message: {
             Text("Are you sure you want to logout?")
-        }
-        .sheet(isPresented: $showHamburgerMenu) {
-            HamburgerMenuView(showHamburgerMenu: $showHamburgerMenu, path: $path, showLogoutAlert: $showLogoutAlert)
         }
         .sheet(isPresented: $showSendSheet) {
             SendTransactionView()
@@ -2202,8 +2202,23 @@ struct HomeView: View {
             initialize()
             setupCompanionTaskListener()
             updateFilteredCoins()
+            openSeedSecurityIfPending()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .zeroaOpenSeedSecurity)) { _ in
+            path.append("seedSecurity")
+        }
+        .onReceive(tlsService.$currentBalance) { balance in
+            tlsBalance = balance
+            coinBalance = balance
         }
         .navigationBarHidden(true)
+    }
+
+    private func openSeedSecurityIfPending() {
+        guard AppGroupsService.shared.consumePendingOpenSeedSecurity() else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            path.append("seedSecurity")
+        }
     }
     
     private func handleCommand(userInput: String = "") {
@@ -2470,12 +2485,13 @@ struct HomeView: View {
     }
     
     private func loadTLSData() async {
-        // Load balance from blockchain
-        if let address = walletService.loadAddress(),
-           let addressInfo = await tlsService.getAddressInfo(address: address) {
-            tlsBalance = addressInfo.balance
-        } else {
-            tlsBalance = 0.0
+        print("🔍 ContentView.loadTLSData: Starting...")
+        
+        // Load aggregated balance across every derived address
+        await tlsService.refreshBalance()
+        await MainActor.run {
+            self.tlsBalance = tlsService.currentBalance
+            print("✅ ContentView.loadTLSData: Balance loaded = \(tlsService.currentBalance) TLS")
         }
         
         // Load real price data from CoinGecko
@@ -2484,8 +2500,12 @@ struct HomeView: View {
         // Load price history for chart
         await loadPriceHistory()
         
-        isLoadingPrice = false
-        isLoadingHistory = false
+        await MainActor.run {
+            isLoadingPrice = false
+            isLoadingHistory = false
+        }
+        
+        print("✅ ContentView.loadTLSData: Complete")
     }
     
     private func loadCoinGeckoPrice() async {
@@ -2588,30 +2608,35 @@ struct HomeView: View {
     }
     
     private func parseTelestaiPrice(from data: Data, source: Int) async -> (price: Double, change: Double)? {
+        func number(_ value: Any?) -> Double? {
+            if let d = value as? Double { return d }
+            if let n = value as? NSNumber { return n.doubleValue }
+            if let s = value as? String { return Double(s) }
+            return nil
+        }
+        
         do {
             switch source {
-            case 0: // CoinGecko
+            case 0: // CoinGecko — usd_24h_change is often null for TLS
                 if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let telestai = json["telestai"] as? [String: Any],
-                   let usd = telestai["usd"] as? Double,
-                   let usdChange = telestai["usd_24h_change"] as? Double {
+                   let usd = number(telestai["usd"]) {
+                    let usdChange = number(telestai["usd_24h_change"]) ?? 0.0
                     return (usd, usdChange)
                 }
             case 1: // Coinpaprika
                 if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let quotes = json["quotes"] as? [String: Any],
                    let usd = quotes["USD"] as? [String: Any],
-                   let price = usd["price"] as? Double,
-                   let change = usd["change_24h"] as? Double {
+                   let price = number(usd["price"]) {
+                    let change = number(usd["change_24h"]) ?? 0.0
                     return (price, change)
                 }
             case 2: // CoinCap
                 if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let data = json["data"] as? [String: Any],
-                   let priceUsd = data["priceUsd"] as? String,
-                   let changePercent24Hr = data["changePercent24Hr"] as? String,
-                   let price = Double(priceUsd),
-                   let change = Double(changePercent24Hr) {
+                   let price = number(data["priceUsd"]) {
+                    let change = number(data["changePercent24Hr"]) ?? 0.0
                     return (price, change)
                 }
             default:
@@ -2884,6 +2909,15 @@ struct HomeView: View {
     }
 }
 
+struct WalletView: View {
+    @Binding var path: NavigationPath
+    @ObservedObject var tlsService: TLSBlockchainService
+    
+    var body: some View {
+        DashboardView(path: $path, tlsService: tlsService, initialTab: 2)
+    }
+}
+
 struct LineChartView: View {
     let data: [Double]
     let width: CGFloat
@@ -3150,18 +3184,15 @@ struct CoinRowView: View {
 
 struct BottomNavigationView: View {
     @Binding var selectedTab: Int
-    @Binding var showMessaging: Bool
-    @Binding var showHamburgerMenu: Bool
-    @Binding var path: NavigationPath
-    @ObservedObject var themeManager: ThemeManager = .shared
-    @State private var showComingSoonAlert = false
+    @ObservedObject private var themeManager = ThemeManager.shared
     
     var body: some View {
         HStack(spacing: 0) {
             // Profile Tab
             Button(action: {
-                selectedTab = 0
-                path.append("profile")
+                if selectedTab != 0 {
+                    selectedTab = 0
+                }
             }) {
                 Image(systemName: selectedTab == 0 ? "person.circle.fill" : "person.circle")
                     .font(.system(size: 32, weight: .medium))
@@ -3172,7 +3203,6 @@ struct BottomNavigationView: View {
             // Messaging Tab
             Button(action: {
                 selectedTab = 1
-                path.append("messaging")
             }) {
                 Image(systemName: selectedTab == 1 ? "message.circle.fill" : "message.circle")
                     .font(.system(size: 32, weight: .medium))
@@ -3180,27 +3210,21 @@ struct BottomNavigationView: View {
                     .frame(maxWidth: .infinity)
             }
             
-            // AI Companion Tab - Coming Soon
+            // Wallet Tab
             Button(action: {
-                // Show coming soon alert
-                showComingSoonAlert = true
-            }) {
-                VStack(spacing: 4) {
-                    Image(systemName: "atom")
-                        .font(.system(size: 24, weight: .medium))
-                        .foregroundColor(DesignSystem.Colors.textSecondary)
-                    
-                    Text("Coming Soon")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(DesignSystem.Colors.textSecondary)
+                if selectedTab != 2 {
+                    selectedTab = 2
                 }
-                .frame(maxWidth: .infinity)
+            }) {
+                Image(systemName: selectedTab == 2 ? "wallet.pass.fill" : "wallet.pass")
+                    .font(.system(size: 32, weight: .medium))
+                    .foregroundColor(selectedTab == 2 ? DesignSystem.Colors.secondary : DesignSystem.Colors.textSecondary)
+                    .frame(maxWidth: .infinity)
             }
             
             // Menu Tab
             Button(action: {
                 selectedTab = 3
-                showHamburgerMenu = true
             }) {
                 Image(systemName: selectedTab == 3 ? "line.3.horizontal.circle.fill" : "line.3.horizontal.circle")
                     .font(.system(size: 32, weight: .medium))
@@ -3209,89 +3233,136 @@ struct BottomNavigationView: View {
             }
         }
         .padding(.vertical, DesignSystem.Spacing.md)
-        .padding(.bottom, DesignSystem.Spacing.xs) // 2mm from bottom of screen
-        .background(DesignSystem.Colors.background)
+        .padding(.bottom, DesignSystem.Spacing.xs)
+        .background(
+            DesignSystem.Colors.background
+                .ignoresSafeArea(edges: .bottom)
+        )
         .overlay(
             Rectangle()
                 .frame(height: 1)
                 .foregroundColor(DesignSystem.Colors.secondary.opacity(0.3)),
             alignment: .top
         )
-        .ignoresSafeArea(.container, edges: .bottom)
-        .alert("Coming Soon", isPresented: $showComingSoonAlert) {
-            Button("OK") { }
-        } message: {
-            Text("Nova AI Companion is coming soon! We're working hard to bring you an amazing AI experience.")
-        }
+        // Force a full rebuild when theme flips so the bar never keeps the old fill.
+        .id(themeManager.currentTheme)
     }
 }
 
-struct HamburgerMenuView: View {
-    @Binding var showHamburgerMenu: Bool
-    @Binding var path: NavigationPath
-    @Binding var showLogoutAlert: Bool
-    @Environment(\.dismiss) private var dismiss
+struct HeaderBar: View {
+    let title: String
+    let titleFont: Font
+    let titleColor: Color
+    let backgroundColor: Color
+    let dividerColor: Color
+    let topPadding: CGFloat
+    let bottomPadding: CGFloat
+    let horizontalPadding: CGFloat
+    private let leading: AnyView
+    private let trailing: AnyView
+    
+    init(
+        title: String,
+        titleFont: Font = DesignSystem.Typography.titleLarge,
+        titleColor: Color = DesignSystem.Colors.text,
+        backgroundColor: Color = DesignSystem.Colors.background,
+        dividerColor: Color = DesignSystem.Colors.secondary.opacity(0.3),
+        topPadding: CGFloat = DesignSystem.Spacing.lg,
+        bottomPadding: CGFloat = DesignSystem.Spacing.sm,
+        horizontalPadding: CGFloat = DesignSystem.Spacing.lg,
+        @ViewBuilder leading: () -> some View = { EmptyView() },
+        @ViewBuilder trailing: () -> some View = { EmptyView() }
+    ) {
+        self.title = title
+        self.titleFont = titleFont
+        self.titleColor = titleColor
+        self.backgroundColor = backgroundColor
+        self.dividerColor = dividerColor
+        self.topPadding = topPadding
+        self.bottomPadding = bottomPadding
+        self.horizontalPadding = horizontalPadding
+        self.leading = AnyView(leading())
+        self.trailing = AnyView(trailing())
+    }
     
     var body: some View {
-        ZStack {
-            DesignSystem.Colors.background
-                .ignoresSafeArea()
-            
-            VStack(spacing: 0) {
-                // Header
+        VStack(spacing: 0) {
+            ZStack {
                 HStack {
-                    Button("Close") {
-                        showHamburgerMenu = false
-                    }
-                    .foregroundColor(DesignSystem.Colors.secondary)
-                    
-                    Spacer()
-                    
-                    Text("Menu")
-                        .font(DesignSystem.Typography.titleMedium)
-                        .foregroundColor(DesignSystem.Colors.text)
-                    
-                    Spacer()
-                    
+                    leading
+                    Spacer(minLength: 0)
+                    trailing
+                }
+                
+                Text(title)
+                    .font(titleFont)
+                    .foregroundColor(titleColor)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+            }
+            .padding(.horizontal, horizontalPadding)
+            .padding(.top, topPadding)
+            .padding(.bottom, bottomPadding)
+            
+            Rectangle()
+                .fill(dividerColor)
+                .frame(height: 1)
+                .padding(.horizontal, horizontalPadding)
+        }
+        .background(
+            backgroundColor
+                .ignoresSafeArea(edges: .top)
+        )
+    }
+}
+
+struct MenuScreenView: View {
+    @Binding var path: NavigationPath
+    @Binding var showLogoutAlert: Bool
+    
+    var body: some View {
+        VStack(spacing: 0) {
+            HeaderBar(
+                title: "Menu",
+                leading: {
+                    Circle()
+                        .fill(Color.clear)
+                        .frame(width: 44, height: 44)
+                },
+                trailing: {
                     Button("Logout") {
                         showLogoutAlert = true
-                        showHamburgerMenu = false
                     }
+                    .font(DesignSystem.Typography.bodyMedium)
                     .foregroundColor(DesignSystem.Colors.secondary)
                 }
-                .padding(.horizontal, DesignSystem.Spacing.lg)
-                .padding(.vertical, DesignSystem.Spacing.md)
-                .background(DesignSystem.Colors.surface)
-                
-                // Menu Items
-                ScrollView {
-                    VStack(spacing: 0) {
-                        MenuButton(title: "Network Stats", icon: "chart.bar") {
-                            path.append("stats")
-                            showHamburgerMenu = false
-                        }
-                        
-                        MenuButton(title: "AI Features", icon: "brain.head.profile") {
-                            path.append("ai")
-                            showHamburgerMenu = false
-                        }
-                        
-                        MenuButton(title: "Settings", icon: "gearshape") {
-                            path.append("settings")
-                            showHamburgerMenu = false
-                        }
-                        
-                        MenuButton(title: "Support & Help", icon: "questionmark.circle") {
-                            path.append("support")
-                            showHamburgerMenu = false
-                        }
-                        
-
+            )
+            
+            ScrollView {
+                VStack(spacing: DesignSystem.Spacing.md) {
+                    MenuButton(title: "Network Stats", icon: "chart.bar") {
+                        path.append("stats")
                     }
-                    .padding(.vertical, DesignSystem.Spacing.md)
+                    
+                    MenuButton(title: "AI Features", icon: "brain.head.profile") {
+                        path.append("ai")
+                    }
+                    
+                    MenuButton(title: "Settings", icon: "gearshape") {
+                        path.append("settings")
+                    }
+                    
+                    MenuButton(title: "Support & Help", icon: "questionmark.circle") {
+                        path.append("support")
+                    }
                 }
+                .padding(.vertical, DesignSystem.Spacing.lg)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .frame(maxWidth: .infinity)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(DesignSystem.Colors.background.ignoresSafeArea())
     }
 }
 
@@ -3301,39 +3372,44 @@ struct MenuButton: View {
     let action: () -> Void
     
     var body: some View {
-        Button(action: action) {
-            HStack(spacing: DesignSystem.Spacing.md) {
-                Image(systemName: icon)
-                    .font(.system(size: 20))
-                    .foregroundColor(DesignSystem.Colors.secondary)
-                    .frame(width: 24)
-                
-                Text(title)
-                    .font(DesignSystem.Typography.bodyMedium)
-                    .foregroundColor(DesignSystem.Colors.text)
-                
-                Spacer()
-                
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 14))
-                    .foregroundColor(DesignSystem.Colors.textSecondary)
+        CardView {
+            Button(action: action) {
+                HStack(spacing: DesignSystem.Spacing.md) {
+                    Image(systemName: icon)
+                        .font(.system(size: 20))
+                        .foregroundColor(DesignSystem.Colors.secondary)
+                        .frame(width: 24)
+                    
+                    Text(title)
+                        .font(DesignSystem.Typography.bodyMedium)
+                        .foregroundColor(DesignSystem.Colors.text)
+                    
+                    Spacer()
+                    
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 14))
+                        .foregroundColor(DesignSystem.Colors.textSecondary)
+                }
+                .padding(.vertical, DesignSystem.Spacing.sm)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(.vertical, DesignSystem.Spacing.sm)
+            .buttonStyle(PlainButtonStyle())
+            .contentShape(Rectangle())
         }
-        .buttonStyle(PlainButtonStyle())
         .padding(.horizontal, DesignSystem.Spacing.lg)
-        .padding(.vertical, DesignSystem.Spacing.sm)
     }
 }
 
 
 
 // MARK: - Profile View
-struct ProfileView: View {
+struct HomeView: View {
     @Binding var path: NavigationPath
+    var isRoot: Bool = false
     @State private var showAlert = false
     @State private var alertMessage = ""
     @State private var isStreaming = false
+    @State private var isAccountActive = true
     @State private var voiceEnabled = false // Disabled by default
     @State private var autoRespond = false
     @State private var profileImage: UIImage?
@@ -3358,7 +3434,23 @@ struct ProfileView: View {
     @State private var showThemePicker = false
     @StateObject private var localizationManager = LocalizationManager.shared
     @StateObject private var themeManager = ThemeManager.shared
+    
+    private let profileDisplayNameKey = "profile_display_name"
+    private let profileImageKey = "profile_image_data"
+    private let profileAccountActiveKey = "profile_account_active"
+    
+    private var profileDefaults: UserDefaults {
+        AppGroupsService.shared.sharedDefaults ?? UserDefaults.standard
+    }
     private let walletService = WalletService.shared
+
+    private func scopedProfileKey(_ base: String) -> String {
+        guard let tls = walletService.loadAddress()?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !tls.isEmpty else {
+            return base
+        }
+        return "\(base)_\(tls)"
+    }
     
     var body: some View {
         ZStack {
@@ -3366,37 +3458,61 @@ struct ProfileView: View {
                 .ignoresSafeArea()
             
             VStack(spacing: DesignSystem.Spacing.lg) {
-                // Header with Back Button
-                HStack {
-                    Button(action: {
-                        path.removeLast()
-                    }) {
-                        Image(systemName: "chevron.left")
-                            .foregroundColor(DesignSystem.Colors.text)
-                            .font(.system(size: 20))
-                            .padding(DesignSystem.Spacing.sm)
-                            .background(DesignSystem.Colors.surface)
-                            .clipShape(Circle())
+                HeaderBar(
+                    title: "Digital Fingerprint",
+                    leading: {
+                        Circle()
+                            .fill(Color.clear)
+                            .frame(width: 44, height: 44)
+                    },
+                    trailing: {
+                        Circle()
+                            .fill(Color.clear)
+                            .frame(width: 44, height: 44)
                     }
-                    
-                    Spacer()
-                    
-                    Text("Profile")
-                        .font(DesignSystem.Typography.titleMedium)
-                        .foregroundColor(DesignSystem.Colors.text)
-                    
-                    Spacer()
-                    
-                    // Placeholder for symmetry
-                    Circle()
-                        .fill(Color.clear)
-                        .frame(width: 44, height: 44)
-                }
-                .padding(.horizontal, DesignSystem.Spacing.lg)
-                .padding(.top, DesignSystem.Spacing.lg)
-                
+                )
+
                 ScrollView {
-                VStack(spacing: DesignSystem.Spacing.lg) {
+                    VStack(spacing: DesignSystem.Spacing.lg) {
+                        VStack(spacing: DesignSystem.Spacing.sm) {
+                            Button(action: {
+                                isAccountActive.toggle()
+                            }) {
+                                ZStack {
+                                    Circle()
+                                        .fill(
+                                            LinearGradient(
+                                                colors: isAccountActive
+                                                ? [DesignSystem.Colors.success.opacity(0.9), DesignSystem.Colors.success]
+                                                : [DesignSystem.Colors.error.opacity(0.9), DesignSystem.Colors.error]
+                                            ,
+                                                startPoint: .topLeading,
+                                                endPoint: .bottomTrailing
+                                            )
+                                        )
+                                        .frame(width: 132, height: 132)
+                                        .shadow(color: (isAccountActive ? DesignSystem.Colors.success : DesignSystem.Colors.error).opacity(0.4), radius: 14, x: 0, y: 8)
+                                        .overlay(
+                                            Circle()
+                                                .stroke(Color.white.opacity(0.25), lineWidth: 2)
+                                        )
+                                    Circle()
+                                        .fill(Color.white.opacity(0.12))
+                                        .frame(width: 122, height: 122)
+                                    Image(systemName: isAccountActive ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                                        .font(.system(size: 96))
+                                        .foregroundColor(.white)
+                                }
+                            }
+                            .buttonStyle(PlainButtonStyle())
+                            
+                            Text(isAccountActive ? "Active" : "Inactive")
+                                .font(DesignSystem.Typography.headline)
+                                .foregroundColor(isAccountActive ? DesignSystem.Colors.success : DesignSystem.Colors.error)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, DesignSystem.Spacing.md)
+                        .padding(.horizontal, DesignSystem.Spacing.lg)
                         // Profile Picture Section
                         CardView {
                             VStack(spacing: DesignSystem.Spacing.md) {
@@ -3429,68 +3545,46 @@ struct ProfileView: View {
                                     .font(DesignSystem.Typography.caption)
                                     .foregroundColor(DesignSystem.Colors.textSecondary)
                                 
+                                if profileImage != nil {
+                                    Button(action: {
+                                        profileImage = nil
+                                        saveProfileImage(nil)
+                                    }) {
+                                        Text("Remove Photo")
+                                            .font(DesignSystem.Typography.bodySmall)
+                                            .foregroundColor(DesignSystem.Colors.error)
+                                    }
+                                    .padding(.top, DesignSystem.Spacing.xs)
+                                }
+                                
                                 // Personal Info Display
                                 VStack(spacing: DesignSystem.Spacing.md) {
-                                    // Display Name
-                                    VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
-                                        Text(LocalizedString.localized("display_name"))
-                                            .font(DesignSystem.Typography.caption)
-                                            .foregroundColor(DesignSystem.Colors.textSecondary)
-                                        Text(displayName.isEmpty ? LocalizedString.localized("not_set") : displayName)
-                                            .font(DesignSystem.Typography.bodyMedium)
-                                            .foregroundColor(DesignSystem.Colors.text)
-                                    }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(DesignSystem.Spacing.sm)
-                                    .background(DesignSystem.Colors.surface.opacity(0.5))
-                                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                                    
-                                    // Bio
-                                    VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
-                                        Text(LocalizedString.localized("bio"))
-                                            .font(DesignSystem.Typography.caption)
-                                            .foregroundColor(DesignSystem.Colors.textSecondary)
-                                        Text(userBio.isEmpty ? LocalizedString.localized("not_set") : userBio)
-                                            .font(DesignSystem.Typography.bodyMedium)
-                                            .foregroundColor(DesignSystem.Colors.text)
-                                            .lineLimit(3)
-                                    }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(DesignSystem.Spacing.sm)
-                                    .background(DesignSystem.Colors.surface.opacity(0.5))
-                                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                                    
-                                    // Location
-                                    VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
-                                        Text(LocalizedString.localized("location"))
-                                            .font(DesignSystem.Typography.caption)
-                                            .foregroundColor(DesignSystem.Colors.textSecondary)
-                                        Text(userLocation.isEmpty ? LocalizedString.localized("not_set") : userLocation)
-                                            .font(DesignSystem.Typography.bodyMedium)
-                                            .foregroundColor(DesignSystem.Colors.text)
-                                    }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(DesignSystem.Spacing.sm)
-                                    .background(DesignSystem.Colors.surface.opacity(0.5))
-                                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                                    
-                                    // Single Edit Button
-                                    Button(action: {
-                                        showEditPersonalInfo = true
-                                    }) {
-                                        HStack(spacing: DesignSystem.Spacing.sm) {
-                                            Image(systemName: "pencil")
-                                                .font(.system(size: 16))
-                                                .foregroundColor(DesignSystem.Colors.secondary)
-                                            Text(LocalizedString.localized("edit"))
+                                    // Display Name with inline edit indicator
+                                    HStack(alignment: .center, spacing: DesignSystem.Spacing.sm) {
+                                        VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
+                                            Text(LocalizedString.localized("display_name"))
+                                                .font(DesignSystem.Typography.caption)
+                                                .foregroundColor(DesignSystem.Colors.textSecondary)
+                                            Text(displayName.isEmpty ? LocalizedString.localized("not_set") : displayName)
                                                 .font(DesignSystem.Typography.bodyMedium)
-                                                .foregroundColor(DesignSystem.Colors.secondary)
+                                                .foregroundColor(DesignSystem.Colors.text)
                                         }
-                                        .frame(maxWidth: .infinity)
-                                        .padding(DesignSystem.Spacing.sm)
-                                        .background(DesignSystem.Colors.secondary.opacity(0.1))
-                                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                                        Spacer()
+                                        Button(action: {
+                                            showEditPersonalInfo = true
+                                        }) {
+                                            Image(systemName: "pencil")
+                                                .font(.system(size: 16, weight: .medium))
+                                                .foregroundColor(DesignSystem.Colors.secondary)
+                                                .padding(DesignSystem.Spacing.xs)
+                                                .background(DesignSystem.Colors.surface.opacity(0.6))
+                                                .clipShape(Circle())
+                                        }
                                     }
+                                    .padding(.horizontal, DesignSystem.Spacing.sm)
+                                    .padding(.vertical, DesignSystem.Spacing.sm)
+                                    .background(DesignSystem.Colors.surface.opacity(0.5))
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
                                 }
                             }
                         }
@@ -3499,17 +3593,16 @@ struct ProfileView: View {
                         // Streaming Switch
                         CardView {
                             VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
-                                Text("Stream Metadata")
+                                Text("Stream Metadata (Currently Disabled)")
                                     .font(DesignSystem.Typography.headline)
                                     .foregroundColor(DesignSystem.Colors.text)
                                 
                                 VStack(spacing: DesignSystem.Spacing.md) {
-                                    Toggle("Enable", isOn: $isStreaming)
+                                    Toggle("Enable", isOn: .constant(false))
                                         .font(DesignSystem.Typography.bodyMedium)
                                         .foregroundColor(DesignSystem.Colors.text)
-                                        .onChange(of: isStreaming, initial: false) { oldValue, newValue in
-                                            UserDefaults.standard.set(newValue, forKey: "user_streaming_enabled")
-                                        }
+                                        .tint(DesignSystem.Colors.textSecondary.opacity(0.4))
+                                        .disabled(true)
                                     
                                     Text("Sell your data to Advertisers")
                                         .font(DesignSystem.Typography.caption)
@@ -3622,7 +3715,13 @@ struct ProfileView: View {
             AnalyticsView(analyticsData: $analyticsData)
         }
         .sheet(isPresented: $showEditPersonalInfo) {
-            EditPersonalInfoView(displayName: $displayName, userBio: $userBio, userLocation: $userLocation)
+            EditPersonalInfoView(
+                initialDisplayName: displayName,
+                onSave: { newName in
+                    displayName = newName
+                    saveDisplayName(newName)
+                }
+            )
         }
         .sheet(isPresented: $showLanguagePicker) {
             PreferencePickerView(title: "Language", selection: $selectedLanguage, options: availableLanguages, onSelectionChanged: { newLanguage in
@@ -3642,15 +3741,25 @@ struct ProfileView: View {
         .onAppear {
             loadSettings()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .zeroaDisplayNameDidChange)) { note in
+            if let name = note.object as? String, !name.isEmpty {
+                displayName = name
+            }
+        }
+        .onChange(of: profileImage) { newValue in
+            saveProfileImage(newValue)
+        }
+        .onChange(of: isAccountActive) { newValue in
+            saveAccountActiveState(newValue)
+        }
     }
     
     private func formatAddress(_ address: String) -> String {
-        if address.count > 20 {
-            let start = String(address.prefix(10))
-            let end = String(address.suffix(10))
-            return "\(start)...\(end)"
-        }
-        return address
+        let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > 12 else { return trimmed }
+        let prefix = trimmed.prefix(5)
+        let suffix = trimmed.suffix(7)
+        return "\(prefix)...\(suffix)"
     }
     
     private func logout() {
@@ -3669,10 +3778,55 @@ struct ProfileView: View {
         selectedCurrency = UserDefaults.standard.string(forKey: "user_currency") ?? "USD"
         selectedTheme = UserDefaults.standard.string(forKey: "user_theme") ?? "Native"
         isStreaming = UserDefaults.standard.bool(forKey: "user_streaming_enabled")
+        loadProfileData()
         
         // Apply loaded settings
         LocalizationManager.shared.currentLanguage = selectedLanguage
         DesignSystem.updateTheme(selectedTheme)
+    }
+    
+    private func loadProfileData() {
+        let scopedImageKey = scopedProfileKey(profileImageKey)
+
+        let tls = walletService.loadAddress()
+        let savedName = AppGroupsService.shared.profileDisplayName(tls: tls)
+        if !savedName.isEmpty {
+            displayName = savedName
+        }
+
+        if let imageData = profileDefaults.data(forKey: scopedImageKey),
+           let image = UIImage(data: imageData) {
+            profileImage = image
+        } else if let imageData = profileDefaults.data(forKey: profileImageKey),
+                  let image = UIImage(data: imageData) {
+            profileImage = image
+        }
+
+        if profileDefaults.object(forKey: profileAccountActiveKey) != nil {
+            isAccountActive = profileDefaults.bool(forKey: profileAccountActiveKey)
+        }
+    }
+    
+    private func saveDisplayName(_ name: String) {
+        AppGroupsService.shared.setProfileDisplayName(name, tls: walletService.loadAddress())
+    }
+    
+    private func saveProfileImage(_ image: UIImage?) {
+        if let image = image,
+           let data = image.jpegData(compressionQuality: 0.85) {
+            profileDefaults.set(data, forKey: profileImageKey)
+            profileDefaults.set(data, forKey: scopedProfileKey(profileImageKey))
+        } else {
+            profileDefaults.removeObject(forKey: profileImageKey)
+            profileDefaults.removeObject(forKey: scopedProfileKey(profileImageKey))
+        }
+        profileDefaults.synchronize()
+    }
+    
+    private func saveAccountActiveState(_ isActive: Bool) {
+        Task {
+            await HaloService.shared.handleAccountActiveChange(isActive)
+        }
     }
     
     private func saveLanguage(_ language: String) {
@@ -3811,15 +3965,40 @@ struct ReceiveView: View {
 
 struct StatsView: View {
     @Binding var path: NavigationPath
+    @ObservedObject private var themeManager = ThemeManager.shared
+    @StateObject private var tlsService = TLSBlockchainService.shared
+    @State private var isLoading = true
+    @State private var networkLabel = TLSNetwork.current.displayName
+    @State private var chain = "—"
+    @State private var algo = "—"
+    @State private var subversion = "—"
+    @State private var blocks = 0
+    @State private var difficulty = 0.0
+    @State private var networkHashrate = 0.0
+    @State private var connected = false
+    @State private var errorText: String?
     
     var body: some View {
         ZStack {
             DesignSystem.Colors.background
                 .ignoresSafeArea()
+                .id(themeManager.currentTheme)
             
             VStack(spacing: DesignSystem.Spacing.lg) {
-                // Header
                 HStack {
+                    Button(action: {
+                        if !path.isEmpty { path.removeLast() }
+                    }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "chevron.left")
+                                .font(.system(size: 16, weight: .semibold))
+                            Text("Back")
+                                .font(DesignSystem.Typography.bodyMedium)
+                                .fontWeight(.semibold)
+                        }
+                        .foregroundColor(DesignSystem.Colors.primary)
+                    }
+                    
                     Spacer()
                     
                     Text("Network Stats")
@@ -3827,29 +4006,113 @@ struct StatsView: View {
                         .foregroundColor(DesignSystem.Colors.text)
                     
                     Spacer()
+                    
+                    // Symmetry placeholder
+                    Color.clear.frame(width: 60, height: 1)
                 }
                 .padding(.horizontal, DesignSystem.Spacing.lg)
                 .padding(.top, DesignSystem.Spacing.lg)
                 
-                Spacer()
-                
-                VStack(spacing: DesignSystem.Spacing.lg) {
-                    Image(systemName: "chart.bar.fill")
-                        .font(.system(size: 60))
-                        .foregroundColor(DesignSystem.Colors.secondary)
-                    
-                    Text("Coming Soon")
-                        .font(DesignSystem.Typography.titleLarge)
-                        .foregroundColor(DesignSystem.Colors.text)
-                    
-                    Text("Network statistics and analytics will be available in a future update.")
+                if isLoading {
+                    Spacer()
+                    ProgressView()
+                        .tint(DesignSystem.Colors.primary)
+                    Text("Loading network stats…")
+                        .font(DesignSystem.Typography.bodyMedium)
+                        .foregroundColor(DesignSystem.Colors.textSecondary)
+                    Spacer()
+                } else {
+                    ScrollView {
+                        VStack(spacing: DesignSystem.Spacing.md) {
+                            if let errorText {
+                                Text(errorText)
+                                    .font(DesignSystem.Typography.bodySmall)
+                                    .foregroundColor(DesignSystem.Colors.warning)
+                                    .multilineTextAlignment(.center)
+                                    .padding(.horizontal)
+                            }
+                            
+                            statCard(title: "Connection", value: connected ? "Online" : "Offline",
+                                     icon: connected ? "wifi" : "wifi.slash",
+                                     accent: connected ? DesignSystem.Colors.success : DesignSystem.Colors.error)
+                            statCard(title: "Network", value: networkLabel, icon: "globe")
+                            statCard(title: "Chain", value: chain, icon: "link")
+                            statCard(title: "PoW", value: algo, icon: "bolt.fill")
+                            statCard(title: "Node", value: subversion, icon: "server.rack")
+                            statCard(title: "Block height", value: blocks.formatted(), icon: "square.stack.3d.up")
+                            statCard(title: "Difficulty", value: String(format: "%.4f", difficulty), icon: "gauge.with.dots.needle.67percent")
+                            statCard(title: "Network hashrate", value: formatHashrate(networkHashrate), icon: "cpu")
+                            
+                            Button("Refresh") {
+                                Task { await loadStats() }
+                            }
                             .font(DesignSystem.Typography.bodyMedium)
-                            .foregroundColor(DesignSystem.Colors.textSecondary)
-                            .multilineTextAlignment(.center)
+                            .fontWeight(.semibold)
+                            .foregroundColor(DesignSystem.Colors.secondary)
+                            .padding(.top, DesignSystem.Spacing.sm)
+                        }
                         .padding(.horizontal, DesignSystem.Spacing.lg)
+                        .padding(.bottom, DesignSystem.Spacing.xl)
+                    }
                 }
-                
+            }
+        }
+        .navigationBarHidden(true)
+        .task { await loadStats() }
+    }
+    
+    private func statCard(title: String, value: String, icon: String, accent: Color = DesignSystem.Colors.secondary) -> some View {
+        CardView {
+            HStack(spacing: DesignSystem.Spacing.md) {
+                Image(systemName: icon)
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundColor(accent)
+                    .frame(width: 28)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title)
+                        .font(DesignSystem.Typography.caption)
+                        .foregroundColor(DesignSystem.Colors.textSecondary)
+                    Text(value)
+                        .font(DesignSystem.Typography.headline)
+                        .foregroundColor(DesignSystem.Colors.text)
+                }
                 Spacer()
+            }
+        }
+    }
+    
+    private func formatHashrate(_ hps: Double) -> String {
+        if hps >= 1_000_000_000 { return String(format: "%.2f GH/s", hps / 1_000_000_000) }
+        if hps >= 1_000_000 { return String(format: "%.2f MH/s", hps / 1_000_000) }
+        if hps >= 1_000 { return String(format: "%.2f kH/s", hps / 1_000) }
+        return String(format: "%.0f H/s", hps)
+    }
+    
+    private func loadStats() async {
+        await MainActor.run { isLoading = true; errorText = nil }
+        connected = await tlsService.checkConnection()
+        
+        do {
+            let status = try await tlsService.fetchNetworkStatus()
+            await MainActor.run {
+                networkLabel = TLSNetwork.current.displayName
+                chain = status.chain
+                algo = status.algo ?? TLSNetwork.current.expectedAlgo
+                subversion = status.subversion ?? "—"
+                blocks = status.blocks
+                difficulty = status.difficulty
+                networkHashrate = status.networkhashps ?? 0
+                connected = true
+                isLoading = false
+            }
+        } catch {
+            await MainActor.run {
+                networkLabel = TLSNetwork.current.displayName
+                errorText = "Could not refresh live stats: \(error.localizedDescription)"
+                if tlsService.lastBlockHeight > 0 {
+                    blocks = tlsService.lastBlockHeight
+                }
+                isLoading = false
             }
         }
     }
@@ -3857,15 +4120,29 @@ struct StatsView: View {
 
 struct AIFeaturesView: View {
     @Binding var path: NavigationPath
+    @ObservedObject private var themeManager = ThemeManager.shared
     
     var body: some View {
         ZStack {
             DesignSystem.Colors.background
                 .ignoresSafeArea()
+                .id(themeManager.currentTheme)
             
             VStack(spacing: DesignSystem.Spacing.lg) {
-                // Header
                 HStack {
+                    Button(action: {
+                        if !path.isEmpty { path.removeLast() }
+                    }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "chevron.left")
+                                .font(.system(size: 16, weight: .semibold))
+                            Text("Back")
+                                .font(DesignSystem.Typography.bodyMedium)
+                                .fontWeight(.semibold)
+                        }
+                        .foregroundColor(DesignSystem.Colors.primary)
+                    }
+                    
                     Spacer()
                     
                     Text("AI Features")
@@ -3873,6 +4150,8 @@ struct AIFeaturesView: View {
                         .foregroundColor(DesignSystem.Colors.text)
                     
                     Spacer()
+                    
+                    Color.clear.frame(width: 60, height: 1)
                 }
                 .padding(.horizontal, DesignSystem.Spacing.lg)
                 .padding(.top, DesignSystem.Spacing.lg)
@@ -3898,6 +4177,7 @@ struct AIFeaturesView: View {
                 Spacer()
             }
         }
+        .navigationBarHidden(true)
     }
 }
 
@@ -4092,6 +4372,7 @@ struct SettingsView: View {
     @State private var showLanguagePicker = false
     @State private var showCurrencyPicker = false
     @State private var showThemePicker = false
+    @State private var useTestnet = UserDefaults.standard.bool(forKey: TLSNetwork.useTestnetDefaultsKey)
     @StateObject private var localizationManager = LocalizationManager.shared
     @StateObject private var themeManager = ThemeManager.shared
     
@@ -4099,6 +4380,7 @@ struct SettingsView: View {
         ZStack {
             DesignSystem.Colors.background
                 .ignoresSafeArea()
+                .id(themeManager.currentTheme)
             
             VStack(spacing: DesignSystem.Spacing.lg) {
                 // Header with Back Button
@@ -4132,6 +4414,74 @@ struct SettingsView: View {
                 
                 ScrollView {
                     VStack(spacing: DesignSystem.Spacing.lg) {
+                        // Contact binding (IdP) + backup status
+                        CardView {
+                            VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
+                                Text("Identity & Contact")
+                                    .font(DesignSystem.Typography.headline)
+                                    .foregroundColor(DesignSystem.Colors.text)
+
+                                if BackupStatusStore.isIncomplete {
+                                    Text("Backup incomplete — write down your recovery phrase before you lose this device.")
+                                        .font(DesignSystem.Typography.bodySmall)
+                                        .foregroundColor(DesignSystem.Colors.warning)
+                                    Button("Open recovery phrase") {
+                                        path.append("seedSecurity")
+                                    }
+                                    .font(DesignSystem.Typography.bodyMedium)
+                                    .foregroundColor(DesignSystem.Colors.secondary)
+                                }
+
+                                if let binding = ContactBindingStore.shared.currentBinding() {
+                                    HStack {
+                                        Text("Linked: \(binding.displayLabel)")
+                                            .font(DesignSystem.Typography.bodyMedium)
+                                            .foregroundColor(DesignSystem.Colors.text)
+                                        Spacer()
+                                        Button("Unbind") {
+                                            ContactBindingStore.shared.unbind()
+                                        }
+                                        .foregroundColor(DesignSystem.Colors.error)
+                                    }
+                                    Text("Contact labels do not own your keys. Unbind anytime.")
+                                        .font(DesignSystem.Typography.caption)
+                                        .foregroundColor(DesignSystem.Colors.textSecondary)
+                                } else {
+                                    Text("No Apple/Google contact linked. Optional — wallet works without it.")
+                                        .font(DesignSystem.Typography.caption)
+                                        .foregroundColor(DesignSystem.Colors.textSecondary)
+                                }
+                            }
+                        }
+                        .padding(.horizontal, DesignSystem.Spacing.lg)
+
+                        CardView {
+                            VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
+                                Text("Telestai Network")
+                                    .font(DesignSystem.Typography.headline)
+                                    .foregroundColor(DesignSystem.Colors.text)
+
+                                Toggle(isOn: $useTestnet) {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Use TestNet 3.0.1")
+                                            .font(DesignSystem.Typography.bodyMedium)
+                                            .foregroundColor(DesignSystem.Colors.text)
+                                        Text(useTestnet
+                                             ? "Explorer uses Optimus Meraki soak (3.0.1). Sends need tls.testnetRpcBaseURL — not mainnet Halo."
+                                             : "Mainnet (Cryptoscope + Halo). Default for App Store builds.")
+                                            .font(DesignSystem.Typography.caption)
+                                            .foregroundColor(DesignSystem.Colors.textSecondary)
+                                    }
+                                }
+                                .tint(DesignSystem.Colors.secondary)
+                                .onChange(of: useTestnet) { _, enabled in
+                                    UserDefaults.standard.set(enabled, forKey: TLSNetwork.useTestnetDefaultsKey)
+                                    TLSRPCClient.shared.setBaseURLOverride(nil)
+                                }
+                            }
+                        }
+                        .padding(.horizontal, DesignSystem.Spacing.lg)
+
                         // AI Status
                         CardView {
                             VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
@@ -4188,6 +4538,24 @@ struct SettingsView: View {
                                             Image(systemName: "iphone")
                                                 .foregroundColor(DesignSystem.Colors.secondary)
                                             Text("Manage Sessions")
+                                                .font(DesignSystem.Typography.bodyMedium)
+                                                .foregroundColor(DesignSystem.Colors.text)
+                                            Spacer()
+                                            Image(systemName: "chevron.right")
+                                                .foregroundColor(DesignSystem.Colors.textSecondary)
+                                        }
+                                    }
+                                    
+                                    Divider()
+                                        .background(DesignSystem.Colors.secondary.opacity(0.1))
+                                    
+                                    Button(action: {
+                                        path.append("seedSecurity")
+                                    }) {
+                                        HStack {
+                                            Image(systemName: "shield.lefthalf.fill")
+                                                .foregroundColor(DesignSystem.Colors.secondary)
+                                            Text("Seed Phrase Security")
                                                 .font(DesignSystem.Typography.bodyMedium)
                                                 .foregroundColor(DesignSystem.Colors.text)
                                             Spacer()
@@ -4305,7 +4673,9 @@ struct SettingsView: View {
                 selection: $selectedTheme,
                 options: availableThemes,
                 onSelectionChanged: { theme in
+                    selectedTheme = theme
                     themeManager.currentTheme = theme
+                    UserDefaults.standard.set(theme, forKey: "user_theme")
                 }
             )
         }
@@ -4321,6 +4691,314 @@ struct SettingsView: View {
     }
 }
 
+struct SeedPhraseSecurityView: View {
+    @Binding var path: NavigationPath
+    @State private var isAuthenticating = false
+    @State private var seedPhrase: String?
+    @State private var authenticationError: String?
+    @State private var privateKeyHex: String?
+    @State private var privateKeyWIF: String?
+    @State private var privateKeyError: String?
+    private let walletService = WalletService.shared
+    
+    var body: some View {
+        ZStack {
+            DesignSystem.Colors.background
+                .ignoresSafeArea()
+            
+            VStack(spacing: DesignSystem.Spacing.lg) {
+                HStack {
+                    Button(action: {
+                        path.removeLast()
+                    }) {
+                        Image(systemName: "chevron.left")
+                            .foregroundColor(DesignSystem.Colors.text)
+                            .font(.system(size: 20))
+                            .padding(DesignSystem.Spacing.sm)
+                            .background(DesignSystem.Colors.surface)
+                            .clipShape(Circle())
+                    }
+                    
+                    Spacer()
+                    
+                    Text("Seed Phrase Security")
+                        .font(DesignSystem.Typography.titleMedium)
+                        .foregroundColor(DesignSystem.Colors.text)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.9)
+                    
+                    Spacer()
+                    
+                    Circle()
+                        .fill(Color.clear)
+                        .frame(width: 44, height: 44)
+                }
+                .padding(.horizontal, DesignSystem.Spacing.lg)
+                .padding(.top, DesignSystem.Spacing.lg)
+                
+                ScrollView {
+                    VStack(spacing: DesignSystem.Spacing.lg) {
+                        CardView {
+                            VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
+                                Text("Protect Your Recovery Phrase")
+                                    .font(DesignSystem.Typography.headline)
+                                    .foregroundColor(DesignSystem.Colors.text)
+                                
+                                Text("Your 12-word seed phrase controls access to your Zeroa wallet. Only view it when you are in a secure and private environment.")
+                                    .font(DesignSystem.Typography.bodyMedium)
+                                    .foregroundColor(DesignSystem.Colors.textSecondary)
+                                
+                                Text("You will be asked to authenticate with Face ID, Touch ID, or your device passcode before the seed phrase is revealed.")
+                                    .font(DesignSystem.Typography.caption)
+                                    .foregroundColor(DesignSystem.Colors.textSecondary)
+                                
+                                if let phrase = seedPhrase {
+                                    VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
+                                        Text("Your Seed Phrase")
+                                            .font(DesignSystem.Typography.bodyMedium)
+                                            .foregroundColor(DesignSystem.Colors.text)
+                                        
+                                        Text(phrase)
+                                            .font(.system(.body, design: .monospaced))
+                                            .foregroundColor(DesignSystem.Colors.text)
+                                            .padding()
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .background(DesignSystem.Colors.surface)
+                                            .clipShape(RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.medium))
+                                        
+                                        Button(action: copySeedPhraseToClipboard) {
+                                            HStack {
+                                                Image(systemName: "doc.on.doc")
+                                                    .font(.system(size: 16, weight: .semibold))
+                                                Text("Copy Seed Phrase")
+                                                    .font(DesignSystem.Typography.bodyMedium)
+                                            }
+                                            .foregroundColor(DesignSystem.Colors.secondary)
+                                            .padding(.vertical, DesignSystem.Spacing.sm)
+                                            .frame(maxWidth: .infinity)
+                                            .background(DesignSystem.Colors.secondary.opacity(0.1))
+                                            .clipShape(RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.medium))
+                                        }
+                                    }
+                                } else {
+                                    Button(action: authenticateAndRevealSecrets) {
+                                        HStack {
+                                            Image(systemName: "exclamationmark.triangle.fill")
+                                                .font(.system(size: 18, weight: .semibold))
+                                            Text("I want to view my seed phrase")
+                                                .font(DesignSystem.Typography.bodyMedium)
+                                                .fontWeight(.semibold)
+                                            Spacer()
+                                            Image(systemName: "chevron.right")
+                                                .font(.system(size: 14, weight: .semibold))
+                                        }
+                                        .foregroundColor(DesignSystem.Colors.error)
+                                        .padding()
+                                        .background(DesignSystem.Colors.error.opacity(0.12))
+                                        .clipShape(RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.medium))
+                                    }
+                                    .disabled(isAuthenticating)
+                                    
+                                    if isAuthenticating {
+                                        ProgressView("Authenticating…")
+                                            .progressViewStyle(CircularProgressViewStyle(tint: DesignSystem.Colors.secondary))
+                                    }
+                                    
+                                    if let authenticationError = authenticationError {
+                                        Text(authenticationError)
+                                            .font(DesignSystem.Typography.caption)
+                                            .foregroundColor(DesignSystem.Colors.error)
+                                            .multilineTextAlignment(.leading)
+                                    }
+                                }
+                            }
+                        }
+                        .padding(.horizontal, DesignSystem.Spacing.lg)
+                        
+                        CardView {
+                            VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
+                                Text("Private Key Access")
+                                    .font(DesignSystem.Typography.headline)
+                                    .foregroundColor(DesignSystem.Colors.text)
+                                
+                                Text("Your private key grants full control over your funds. Only reveal or copy it when you are offline and in a trusted environment.")
+                                    .font(DesignSystem.Typography.bodyMedium)
+                                    .foregroundColor(DesignSystem.Colors.textSecondary)
+                                
+                                Text("The key is shown in both raw hex and WIF so you can import it into Telestai Core or other wallets.")
+                                    .font(DesignSystem.Typography.caption)
+                                    .foregroundColor(DesignSystem.Colors.textSecondary)
+                                
+                                if let hex = privateKeyHex, let wif = privateKeyWIF {
+                                    VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
+                                        VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
+                                            Text("Private Key (Hex)")
+                                                .font(DesignSystem.Typography.bodyMedium)
+                                                .foregroundColor(DesignSystem.Colors.text)
+                                            Text(hex)
+                                                .font(.system(.body, design: .monospaced))
+                                                .foregroundColor(DesignSystem.Colors.text)
+                                                .padding()
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                                .background(DesignSystem.Colors.surface)
+                                                .clipShape(RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.medium))
+                                            
+                                            Button(action: copyPrivateKeyHex) {
+                                                HStack {
+                                                    Image(systemName: "doc.on.doc")
+                                                        .font(.system(size: 16, weight: .semibold))
+                                                    Text("Copy Hex Key")
+                                                        .font(DesignSystem.Typography.bodyMedium)
+                                                }
+                                                .foregroundColor(DesignSystem.Colors.secondary)
+                                                .padding(.vertical, DesignSystem.Spacing.sm)
+                                                .frame(maxWidth: .infinity)
+                                                .background(DesignSystem.Colors.secondary.opacity(0.1))
+                                                .clipShape(RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.medium))
+                                            }
+                                        }
+                                        
+                                        VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
+                                            Text("Private Key (WIF)")
+                                                .font(DesignSystem.Typography.bodyMedium)
+                                                .foregroundColor(DesignSystem.Colors.text)
+                                            Text(wif)
+                                                .font(.system(.body, design: .monospaced))
+                                                .foregroundColor(DesignSystem.Colors.text)
+                                                .padding()
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                                .background(DesignSystem.Colors.surface)
+                                                .clipShape(RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.medium))
+                                            
+                                            Button(action: copyPrivateKeyWIF) {
+                                                HStack {
+                                                    Image(systemName: "doc.on.doc")
+                                                        .font(.system(size: 16, weight: .semibold))
+                                                    Text("Copy WIF Key")
+                                                        .font(DesignSystem.Typography.bodyMedium)
+                                                }
+                                                .foregroundColor(DesignSystem.Colors.secondary)
+                                                .padding(.vertical, DesignSystem.Spacing.sm)
+                                                .frame(maxWidth: .infinity)
+                                                .background(DesignSystem.Colors.secondary.opacity(0.1))
+                                                .clipShape(RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.medium))
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    Button(action: authenticateAndRevealSecrets) {
+                                        HStack {
+                                            Image(systemName: "lock.open.fill")
+                                                .font(.system(size: 18, weight: .semibold))
+                                            Text("I want to view my private key")
+                                                .font(DesignSystem.Typography.bodyMedium)
+                                                .fontWeight(.semibold)
+                                            Spacer()
+                                            Image(systemName: "chevron.right")
+                                                .font(.system(size: 14, weight: .semibold))
+                                        }
+                                        .foregroundColor(DesignSystem.Colors.error)
+                                        .padding()
+                                        .background(DesignSystem.Colors.error.opacity(0.12))
+                                        .clipShape(RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.medium))
+                                    }
+                                    .disabled(isAuthenticating)
+                                    
+                                    if let privateKeyError = privateKeyError {
+                                        Text(privateKeyError)
+                                            .font(DesignSystem.Typography.caption)
+                                            .foregroundColor(DesignSystem.Colors.error)
+                                            .multilineTextAlignment(.leading)
+                                    }
+                                }
+                            }
+                        }
+                        .padding(.horizontal, DesignSystem.Spacing.lg)
+                    }
+                }
+            }
+        }
+        .navigationBarHidden(true)
+    }
+    
+    private func authenticateAndRevealSecrets() {
+        authenticationError = nil
+        privateKeyError = nil
+        isAuthenticating = true
+        
+        let context = LAContext()
+        context.localizedCancelTitle = "Cancel"
+        
+        var authError: NSError?
+        if context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &authError) {
+            context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "Authenticate to view your wallet seed phrase") { success, evaluationError in
+                DispatchQueue.main.async {
+                    isAuthenticating = false
+                    
+                    guard success else {
+                        authenticationError = evaluationError?.localizedDescription ?? "Authentication failed."
+                        return
+                    }
+                    
+                    if let phrase = walletService.loadMnemonic(), !phrase.isEmpty {
+                        seedPhrase = phrase
+                        BackupStatusStore.markCeremonyComplete()
+                    } else {
+                        authenticationError = "No seed phrase is stored on this device."
+                    }
+                    
+                    loadPrivateKey()
+                }
+            }
+        } else {
+            DispatchQueue.main.async {
+                isAuthenticating = false
+                authenticationError = authError?.localizedDescription ?? "Device authentication is unavailable."
+            }
+        }
+    }
+    
+    private func copySeedPhraseToClipboard() {
+        guard let phrase = seedPhrase else { return }
+        UIPasteboard.general.string = phrase
+    }
+    
+    private func copyPrivateKeyHex() {
+        guard let hex = privateKeyHex else { return }
+        UIPasteboard.general.string = hex
+    }
+    
+    private func copyPrivateKeyWIF() {
+        guard let wif = privateKeyWIF else { return }
+        UIPasteboard.general.string = wif
+    }
+    
+    private func loadPrivateKey() {
+        privateKeyHex = nil
+        privateKeyWIF = nil
+        
+        do {
+            let derived = try walletService.exportActiveWallet()
+            privateKeyHex = derived.privateKey.hexString.lowercased()
+            privateKeyWIF = generateWIF(from: derived.privateKey)
+            privateKeyError = nil
+        } catch {
+            privateKeyError = "Unable to derive private key for the current address."
+        }
+    }
+    
+    private func generateWIF(from privateKey: Data) -> String {
+        let versionByte: UInt8 = 0x80
+        let compressionFlag: UInt8 = 0x01
+        var payload = Data([versionByte])
+        payload.append(privateKey)
+        payload.append(compressionFlag)
+        let firstHash = Data(SHA256.hash(data: payload))
+        let checksum = Data(SHA256.hash(data: firstHash)).prefix(4)
+        payload.append(checksum)
+        return Base58.encode(payload)
+    }
+}
 // MARK: - Supporting Views for Profile
 struct SessionManagementView: View {
     @Binding var sessions: [SessionInfo]
@@ -4697,9 +5375,13 @@ struct BugReportView: View {
 
 struct EditPersonalInfoView: View {
     @Environment(\.dismiss) private var dismiss
-    @Binding var displayName: String
-    @Binding var userBio: String
-    @Binding var userLocation: String
+    @State private var draftDisplayName: String
+    let onSave: (String) -> Void
+    
+    init(initialDisplayName: String, onSave: @escaping (String) -> Void) {
+        _draftDisplayName = State(initialValue: initialDisplayName)
+        self.onSave = onSave
+    }
     
     var body: some View {
         NavigationView {
@@ -4716,13 +5398,14 @@ struct EditPersonalInfoView: View {
                         
                         Spacer()
                         
-                        Text("Edit Personal Info")
+                        Text("Edit Display Name")
                             .font(DesignSystem.Typography.titleMedium)
                             .foregroundColor(DesignSystem.Colors.text)
                         
                         Spacer()
                         
                         Button("Save") {
+                            onSave(draftDisplayName.trimmingCharacters(in: .whitespacesAndNewlines))
                             dismiss()
                         }
                         .foregroundColor(DesignSystem.Colors.secondary)
@@ -4730,30 +5413,20 @@ struct EditPersonalInfoView: View {
                     .padding(.horizontal, DesignSystem.Spacing.lg)
                     .padding(.top, DesignSystem.Spacing.lg)
                     
-                    ScrollView {
-                        VStack(spacing: DesignSystem.Spacing.lg) {
-                            CardView {
-                                VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
-                                    Text("Personal Information")
-                                        .font(DesignSystem.Typography.headline)
-                                        .foregroundColor(DesignSystem.Colors.text)
-                                    
-                                    VStack(spacing: DesignSystem.Spacing.md) {
-                                        InputField("Display Name", text: $displayName)
-                                            .textFieldStyle(RoundedBorderTextFieldStyle())
-                                        
-                                        InputField("Bio", text: $userBio)
-                                            .textFieldStyle(RoundedBorderTextFieldStyle())
-                                        
-                                        InputField("Location", text: $userLocation)
-                                            .textFieldStyle(RoundedBorderTextFieldStyle())
-                                    }
-                                }
-                            }
-                            .padding(.horizontal, DesignSystem.Spacing.lg)
+                    CardView {
+                        VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
+                            Text("Display Name")
+                                .font(DesignSystem.Typography.headline)
+                                .foregroundColor(DesignSystem.Colors.text)
+                            
+                            TextField("Enter display name", text: $draftDisplayName)
+                                .textFieldStyle(RoundedBorderTextFieldStyle())
+                                .font(DesignSystem.Typography.bodyMedium)
                         }
-                        .padding(.vertical, DesignSystem.Spacing.lg)
                     }
+                    .padding(.horizontal, DesignSystem.Spacing.lg)
+                    
+                    Spacer()
                 }
             }
             .navigationBarHidden(true)
@@ -4925,12 +5598,14 @@ struct PreferencePickerView: View {
     let options: [String]
     let onSelectionChanged: ((String) -> Void)?
     @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var themeManager = ThemeManager.shared
     
     var body: some View {
         NavigationView {
             ZStack {
                 DesignSystem.Colors.background
                     .ignoresSafeArea()
+                    .id(themeManager.currentTheme)
                 
                 VStack(spacing: DesignSystem.Spacing.lg) {
                     HStack {
